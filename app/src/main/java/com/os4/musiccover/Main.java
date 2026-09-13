@@ -272,6 +272,10 @@ public class Main extends XposedModule {
      * wherever the glass state itself is.
      */
     private static volatile boolean sGlassSettled;
+    /** Armed once the HyperLight (统一柔光玻璃) counter-hook is installed; see armMiGlassGuard(). */
+    private static volatile boolean sMiGlassGuardArmed;
+    /** How many times the counter-hook actually fired on a clock glyph, for the one-line proof. */
+    private static volatile int sMiGlassGuardHits;
 
     /** ClockViewType constants by name, resolved once. See oemPart(). */
     private static volatile java.util.Map<String, Object> sViewTypes;
@@ -729,6 +733,11 @@ public class Main extends XposedModule {
                 Object result = chain.proceed();
                 sContainer = (View) chain.getThisObject();
                 captureScreenSize(sContainer);
+                // The clock container attach is the first reliably-fired event after both
+                // modules' onPackageLoaded, so arming the HyperLight counter-hook here - not
+                // from setGlassColor, which this build never calls on the all_in_one clock -
+                // guarantees it registers after HyperLight's own View.setMiGlass hook.
+                armMiGlassGuard();
                 Xp.log(TAG + "clock container attached: " + sContainer);
                 try {
                     registerReceiver(sContainer.getContext().getApplicationContext());
@@ -1617,8 +1626,10 @@ public class Main extends XposedModule {
                         setCoverEnabled(on, anim, false);
                     } else if ("needart".equals(op)) {
                         // The wallpaper process came up with nothing to draw - see
-                        // WallpaperProbe.askForArt(). It only sends this while its own art is
-                        // null, and stops the moment one arrives, so this cannot loop.
+                        // WallpaperProbe.askForArt(). It asks once per process start, and there
+                        // is a floor between two asks and a ceiling on how many, so this cannot
+                        // loop. What it may well be holding is the previous track's cover off
+                        // its own disk, which is a state it cannot tell from the right one.
                         String why = i.getStringExtra("why");
                         if (!sCoverMode) {
                             // NOT ignored, and that was the bug behind "the wallpaper will not
@@ -6094,11 +6105,26 @@ public class Main extends XposedModule {
             full.compress(Bitmap.CompressFormat.JPEG, q, bos);
             jpg = bos.toByteArray();
             q -= 15;
-        } while (jpg.length > 600 * 1024 && q > 25);
-        out.putExtra("jpg", jpg);
+        } while (jpg.length > 700 * 1024 && q > 25);
         // The cover video's own crossfade is built in the wallpaper process out of this, so
         // whether to ask for it has to travel with the push. See sVideoFade.
         out.putExtra("vfade", sVideoFade);
+        // By path, not by value, and that is not an optimisation.
+        //
+        // Measured on this phone: the largest cover in the library composes to 612KB, the
+        // broadcast carrying it fails on the way out with `Binder transaction failure ...
+        // error: -28 (No space left on device - Binder buffer full)`, system_server gives up on
+        // the send, and Android kills the wallpaper process for a broadcast that could not be
+        // delivered. Everything smaller went through, so size is the whole of the difference.
+        // The process comes back, restores the previous track's cover from its own disk and
+        // never asks for the right one, because as far as it knows it has art - which is the
+        // album cover from the track before, on the lock screen, for the whole track.
+        //
+        // The byte path stays as the fallback: a build whose SELinux refuses the write still
+        // has to work, and that is what it worked with before.
+        String shared = writeSharedArt(jpg);
+        if (shared != null) out.putExtra("file", shared);
+        else out.putExtra("jpg", jpg);
         // Send broadcast first so wallpaper process begins decoding/encoding immediately!
         ctx.sendBroadcast(out);
         Xp.log(TAG + "pushart " + w + "x" + h + " bias=" + sBias
@@ -7019,6 +7045,36 @@ public class Main extends XposedModule {
      * retry that finally found artwork would put the cover back after cover mode had ended.
      */
     private static volatile int sPushGen;
+
+    /**
+     * Where a composed cover is handed to the wallpaper process. See writeSharedArt().
+     *
+     * MIUI's own wallpaper tree: mode 0777 and owned by the wallpaper app, and measured from
+     * inside both processes - SystemUI writes and the wallpaper process reads, under Enforcing
+     * SELinux and with the file made world-readable.
+     */
+    static final String SHARE_DIR = "/data/system/theme_magic/users/0/wallpaper";
+    static final String SHARE_FILE = "mc_art_shared.jpg";
+
+    /**
+     * Puts a composed cover where the wallpaper process can read it, and answers the path - or
+     * null when this process cannot write there, which sends the caller back to the broadcast.
+     *
+     * Readable by everyone on purpose: the two processes do not share a uid.
+     */
+    private static String writeSharedArt(byte[] jpg) {
+        try {
+            java.io.File f = new java.io.File(SHARE_DIR, SHARE_FILE);
+            java.io.FileOutputStream out = new java.io.FileOutputStream(f);
+            out.write(jpg);
+            out.close();
+            f.setReadable(true, false);
+            return f.getAbsolutePath();
+        } catch (Throwable t) {
+            Xp.log(TAG + "shared art write failed, carrying it in the broadcast: " + t);
+            return null;
+        }
+    }
 
     private static void pushArtAsync(final boolean on, final boolean fresh) {
         final Context ctx = sAppCtx;
@@ -8794,6 +8850,29 @@ public class Main extends XposedModule {
     }
 
     /**
+     * Whether the control centre is pulled down over the lock screen.
+     *
+     * The swipe-down centre does not hide the keyguard the way the full settings expansion does -
+     * measured, the clock container and the card both stay shown - so every guard the cover tap
+     * already has is still true, and a tap aimed at a quick toggle toggles the cover instead.
+     * What does flip with the centre is its window view: GONE while it is shut, VISIBLE while it
+     * is open, under a container and a content wrapper that are themselves always VISIBLE. That
+     * window view has no id of its own, so it is reached as the first child of the content
+     * wrapper rather than looked up directly.
+     *
+     * Falling back to false when the tree cannot be resolved keeps the tap working on a build
+     * that renamed these views, rather than silently switching the whole feature off.
+     */
+    private static boolean controlCenterUp() {
+        View cc = findSysuiView("control_center_container");
+        if (!(cc instanceof ViewGroup)) return false;
+        View content = findByName(cc, "content_container");
+        if (!(content instanceof ViewGroup)) return false;
+        ViewGroup g = (ViewGroup) content;
+        return g.getChildCount() > 0 && g.getChildAt(0).isShown();
+    }
+
+    /**
      * Back to the plain wallpaper, with the card left standing where it is.
      *
      * sTapSuppressed is what holds it that way. A card being up is exactly what the module reads
@@ -9568,6 +9647,9 @@ public class Main extends XposedModule {
         if (c == null || !c.isShown()) return;
         // The pad is up, so the taps on it are its own.
         if (bouncerUp()) return;
+        // The control centre covers the same region without hiding the clock, so none of the
+        // guards above see it: a tap aimed at a quick toggle must not toggle the cover.
+        if (controlCenterUp()) return;
         // Nothing to toggle without music: the card is the switch, and this only chooses
         // whether the cover follows it.
         if (!sCardKnown || !sCardShowing) return;
@@ -9868,6 +9950,62 @@ public class Main extends XposedModule {
         }
         sGlassClasses.put(c, glass);
         return glass;
+    }
+
+    /**
+     * Counter-hook for HyperLight's "统一柔光玻璃" (its SoftGlassMaterialHook).
+     *
+     * HyperLight hooks {@code View.setMiGlass(float[])} and, for any view its classifier admits,
+     * rewrites the whole 42-float MiGlass array to its soft-glass preset - indices 0..36, and
+     * [34] and [36] in particular. Index 36 is the liquid-glass channel this module drives
+     * through {@code updateGlassValue -> glassData[36]}; rewriting it is what turns the clock
+     * from 液态玻璃 into plain glass ("非液态").
+     *
+     * Its classifier (gu1.o) admits a view whose setMiGlass happens with a
+     * notification/shade/control-centre frame on the stack, which is exactly the media-card ->
+     * cover-mode transition - which is why the clock comes up liquid after a restart and loses it
+     * a moment after music starts, rather than immediately.
+     *
+     * The crucial asymmetry: HyperLight rewrites the COPY handed to setMiGlass, never the view's
+     * own {@code glassData} field, so the field still holds the OEM's liquid values. Handing the
+     * field back for the clock's own glyphs is the whole fix.
+     *
+     * Armed from the clock container's onAttachedToWindow rather than at onPackageLoaded - that
+     * event reliably fires after both modules are loaded, so this hook registers AFTER HyperLight's
+     * and runs last in the chain, where the last writer to args[0] is what the original receives.
+     */
+    private static void armMiGlassGuard() {
+        if (sMiGlassGuardArmed) return;
+        sMiGlassGuardArmed = true;
+        try {
+            Xp.hookAll(View.class, "setMiGlass", chain -> {
+                Object self = chain.getThisObject();
+                if (!(self instanceof View) || !declaresGlass((View) self)) return chain.proceed();
+                Object[] args = chain.getArgs().toArray();
+                boolean restored = false;
+                if (args.length >= 1 && args[0] instanceof float[]) {
+                    try {
+                        float[] oem = (float[]) Xp.getObjectField((View) self, "glassData");
+                        if (oem != null && oem.length >= 42) {
+                            args[0] = oem;
+                            restored = true;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                int hits = ++sMiGlassGuardHits;
+                // The first few fires prove which view carries the clock's glass and that the
+                // field is there to hand back; the rest are counted rather than spammed.
+                if (hits <= 5 || hits % 50 == 0) {
+                    Xp.log(TAG + "setMiGlass guard fired (" + hits + ") on "
+                            + viewIdOf((View) self) + " restored=" + restored);
+                }
+                return chain.proceed(args);
+            });
+            Xp.log(TAG + "HyperLight setMiGlass guard armed");
+        } catch (Throwable t) {
+            Xp.log(TAG + "HyperLight setMiGlass guard unavailable: " + t);
+        }
     }
 
     /**
