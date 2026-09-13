@@ -12,15 +12,27 @@ import java.io.File;
 import java.nio.ByteBuffer;
 
 /**
- * Encodes an album art Bitmap into a minimal 1-frame MP4 video via Android's native
+ * Encodes an album art Bitmap into a minimal MP4 video via Android's native
  * MediaCodec + MediaMuxer, so HyperOS's FastPlayer video wallpaper engine can play/freeze
  * it directly on the wallpaper window surface without any cross-window blur bleed-through.
+ *
+ * Optionally the video walks IN from another bitmap - see {@link #encodeToMp4}. A cover that
+ * appears in one frame is what the notif cards' blurred background cannot follow: the wallpaper
+ * window is what that blur samples, FastPlayer swaps its frames with no View-layer transition
+ * above it, and a single-frame replacement therefore changes every card's background in one
+ * frame. A fade gives it the same shape the still path already has (WallpaperProbe.startFade),
+ * which is the only other place this module can reach that window.
  */
 public class CoverVideoEncoder {
 
     private static final String TAG = "[MCCoverEnc] ";
     private static final String MIME_TYPE = "video/avc";
     private static final int TIMEOUT_US = 10000;
+    /** Frame period a fade is encoded at, and the longest one worth encoding. */
+    private static final long FADE_FRAME_MS = 33L;
+    private static final int FADE_MAX_FRAMES = 12;
+    /** The tail sample every cover video ends with, exactly as the one-frame cover always had it. */
+    private static final long TAIL_MS = 100L;
 
     private static volatile long sLastContentKey = 0;
     private static volatile String sCachedVideoPath = null;
@@ -34,7 +46,7 @@ public class CoverVideoEncoder {
      * @return true if successful, false otherwise
      */
     public static synchronized boolean encodeBitmapToMp4(Bitmap bitmap, File destFile) {
-        return encodeBitmapToMp4(bitmap, destFile, 0);
+        return encodeToMp4(null, bitmap, destFile, 0, 0);
     }
 
     /**
@@ -46,13 +58,51 @@ public class CoverVideoEncoder {
      * @return true if successful, false otherwise
      */
     public static synchronized boolean encodeBitmapToMp4(Bitmap bitmap, File destFile, long contentKey) {
-        if (bitmap == null || bitmap.isRecycled()) {
-            Xp.log(TAG + "encodeBitmapToMp4: bitmap is null or recycled");
+        return encodeToMp4(null, bitmap, destFile, contentKey, 0);
+    }
+
+    /**
+     * The cover video: `to`, optionally walking in from `from` over `fadeMs`.
+     *
+     * Both ends have to be the same size - the caller has them at the wallpaper's size already -
+     * and every frame between them is a byte-wise walk in YUV, so a twelve-frame fade costs two
+     * conversions of the picture rather than twelve.
+     *
+     * Both ends being available is a request, not a requirement. A fade with nothing to fade
+     * from is the one-frame cover this has always been, and a fade that fails to encode falls
+     * back to exactly that rather than leaving the lock screen without a cover video: the two
+     * halves of the cover are put up by different code paths, and the SystemUI view does not
+     * care whether the wallpaper window caught up.
+     *
+     * @param from the picture to walk in from, or null for a one-frame cover
+     * @param to the album cover
+     * @param fadeMs how long the walk takes; ignored when `from` is null
+     */
+    public static synchronized boolean encodeToMp4(Bitmap from, Bitmap to, File destFile,
+                                                   long contentKey, long fadeMs) {
+        if (to == null || to.isRecycled()) {
+            Xp.log(TAG + "encodeToMp4: bitmap is null or recycled");
             return false;
         }
+        if (from != null && (from.isRecycled() || from == to)) from = null;
+        boolean ok = encodeOnce(from, to, destFile, contentKey, fadeMs);
+        if (!ok && from != null) {
+            Xp.log(TAG + "the cover's crossfade did not encode - falling back to a one-frame cover");
+            ok = encodeOnce(null, to, destFile, contentKey, 0);
+        }
+        return ok;
+    }
 
+    private static boolean encodeOnce(Bitmap from, Bitmap to, File destFile,
+                                      long contentKey, long fadeMs) {
+        Bitmap bitmap = to;
         if (contentKey == 0) {
             contentKey = computeBitmapChecksum(bitmap);
+        }
+        // A fade is a different file from the same cover without one, so the other end is part
+        // of what the cache is keyed on. With no `from` the key is the one it has always been.
+        if (from != null) {
+            contentKey = contentKey * 31L + computeBitmapChecksum(from);
         }
 
         if (contentKey != 0 && contentKey == sLastContentKey && destFile.exists() && destFile.length() > 0) {
@@ -75,6 +125,7 @@ public class CoverVideoEncoder {
 
         MediaCodec encoder = null;
         MediaMuxer muxer = null;
+        Bitmap scaledFrom = null;
 
         try {
             MediaCodecInfo codecInfo = selectCodec(MIME_TYPE);
@@ -109,6 +160,13 @@ public class CoverVideoEncoder {
                 if (prev != null && prev != scaledBitmap) prev.recycle();
             }
 
+            // The other end of the fade, at the settled size. Scaled once, here, rather than per
+            // frame: the walk between the two happens in YUV and never looks at a Bitmap again.
+            if (from != null) {
+                scaledFrom = (from.getWidth() == width && from.getHeight() == height) ? from
+                        : Bitmap.createScaledBitmap(from, width, height, true);
+            }
+
             MediaFormat format = MediaFormat.createVideoFormat(MIME_TYPE, width, height);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
             format.setInteger(MediaFormat.KEY_BIT_RATE, 2000000);
@@ -123,9 +181,10 @@ public class CoverVideoEncoder {
             if (rawFile.exists()) {
                 rawFile.delete();
             }
-            if (destFile.exists()) {
-                destFile.delete();
-            }
+            // The previous cover video is NOT deleted here, and no failure path below deletes
+            // it either: this device has been left with no cover at all by an encode that
+            // failed after the delete. The new file is written beside it and only replaces it
+            // once the muxer has handed back a real MP4.
             File parent = destFile.getParentFile();
             if (parent != null && !parent.exists()) {
                 parent.mkdirs();
@@ -133,88 +192,70 @@ public class CoverVideoEncoder {
 
             muxer = new MediaMuxer(rawFile.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 
-            int trackIndex = -1;
-            boolean muxerStarted = false;
-
-            // Prepare YUV buffer
-            int[] argb = new int[width * height];
-            scaledBitmap.getPixels(argb, 0, width, 0, 0, width, height);
-            byte[] yuv = new byte[width * height * 3 / 2];
-            if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
-                encodeYUV420P(yuv, argb, width, height);
-            } else {
-                encodeYUV420SP(yuv, argb, width, height);
-            }
-
             MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+            Sink sink = new Sink();
+            sink.muxer = muxer;
 
-            // Feed 2 identical frames (0ms and 100ms) with EOS on frame 1
-            for (int frame = 0; frame < 2; frame++) {
+            // The two ends, converted once each. The frames between them are a walk between the
+            // two byte arrays - twelve conversions of a full-screen picture in Java is most of a
+            // second, and this sits in front of the player's first frame, which is exactly the
+            // latency the fade exists to cover.
+            byte[] yuvTo = toYuv(scaledBitmap, width, height, colorFormat);
+            byte[] yuvFrom = (scaledFrom == null) ? null
+                    : toYuv(scaledFrom, width, height, colorFormat);
+            byte[] yuv = new byte[yuvTo.length];
+
+            // One frame per frame period asked for, bounded at both ends: one frame is the cover
+            // with no fade at all, and a fade longer than FADE_MAX_FRAMES is a fade whose cost
+            // has stopped being worth its smoothness.
+            int fadeFrames = yuvFrom == null ? 1
+                    : Math.max(2, Math.min(FADE_MAX_FRAMES, (int) (fadeMs / FADE_FRAME_MS) + 1));
+
+            for (int frame = 0; frame <= fadeFrames; frame++) {
+                boolean tail = frame == fadeFrames;
+                float t = (yuvFrom == null || tail) ? 1f : frame / (float) (fadeFrames - 1);
+                fillFrame(yuv, yuvFrom, yuvTo, t);
+                // The tail sample keeps the one-frame cover's own timing exactly (0ms and 100ms),
+                // which is the file every device has been playing until now; a fade's own frames
+                // run at the frame period and the tail sits a period after the last of them.
+                long pts = (tail ? (fadeFrames == 1 ? TAIL_MS
+                        : fadeFrames * FADE_FRAME_MS + TAIL_MS) : frame * FADE_FRAME_MS) * 1000L;
+                int flags = tail ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0;
+
                 int inputIndex = -1;
                 while (inputIndex < 0 && (SystemClock.uptimeMillis() - startTime) < 2000L) {
                     inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US);
                 }
-                if (inputIndex >= 0) {
-                    ByteBuffer inputBuffer = encoder.getInputBuffer(inputIndex);
-                    if (inputBuffer != null) {
-                        inputBuffer.clear();
-                        inputBuffer.put(yuv);
-                        long pts = frame * 100000L; // 0us, 100000us (100ms)
-                        int flags = (frame == 1) ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0;
-                        encoder.queueInputBuffer(inputIndex, 0, yuv.length, pts, flags);
-                    }
-                } else {
-                    Xp.log(TAG + "Failed to dequeue input buffer for frame " + frame);
+                if (inputIndex < 0) {
+                    Xp.log(TAG + "Failed to dequeue input buffer for frame " + frame
+                            + " of " + (fadeFrames + 1));
                     rawFile.delete();
                     return false;
                 }
-            }
-
-            // Drain encoder output into muxer
-            boolean eosReached = false;
-            while (!eosReached) {
-                int outputIndex = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US);
-                if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    if ((SystemClock.uptimeMillis() - startTime) > 2000L) {
-                        Xp.log(TAG + "Encoding timed out after 2000ms");
-                        break;
+                ByteBuffer inputBuffer = encoder.getInputBuffer(inputIndex);
+                if (inputBuffer != null) {
+                    inputBuffer.clear();
+                    inputBuffer.put(yuv);
+                    encoder.queueInputBuffer(inputIndex, 0, yuv.length, pts, flags);
+                }
+                // Drained per frame rather than at the end: the codec holds a handful of input
+                // buffers, and a fade is more frames than there are buffers - queueing them all
+                // first would block on the first one that did not fit. The per-frame drain can
+                // be the one that sees EOS (it comes with the tail frame's output), in which
+                // case the loop stops here - feeding the codec past EOS would make the final
+                // drain wait for a second end-of-stream forever.
+                if (!drain(encoder, sink, bufferInfo, false, 0L) || sink.eos) {
+                    if (!sink.eos) {
+                        rawFile.delete();
+                        return false;
                     }
-                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    if (muxerStarted) {
-                        throw new RuntimeException("format changed twice");
-                    }
-                    MediaFormat newFormat = encoder.getOutputFormat();
-                    trackIndex = muxer.addTrack(newFormat);
-                    muxer.start();
-                    muxerStarted = true;
-                } else if (outputIndex >= 0) {
-                    ByteBuffer outputBuffer = encoder.getOutputBuffer(outputIndex);
-                    if (outputBuffer != null) {
-                        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                            bufferInfo.size = 0;
-                        }
-                        if (bufferInfo.size != 0) {
-                            if (!muxerStarted) {
-                                throw new RuntimeException("muxer hasn't started");
-                            }
-                            outputBuffer.position(bufferInfo.offset);
-                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
-                            muxer.writeSampleData(trackIndex, outputBuffer, bufferInfo);
-                        }
-                        encoder.releaseOutputBuffer(outputIndex, false);
-                        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            eosReached = true;
-                        }
-                    }
+                    break;
                 }
             }
 
-            if (!eosReached) {
-                Xp.log(TAG + "encodeBitmapToMp4: timed out or ended before EOS");
+            if (!sink.eos && !drain(encoder, sink, bufferInfo, true, 0L)) {
+                Xp.log(TAG + "encodeToMp4: timed out or ended before EOS");
                 rawFile.delete();
-                if (destFile.exists()) {
-                    destFile.delete();
-                }
                 return false;
             }
 
@@ -243,7 +284,9 @@ public class CoverVideoEncoder {
             sCachedVideoPath = destFile.getAbsolutePath();
             long cost = SystemClock.uptimeMillis() - startTime;
             Xp.log(TAG + "Dual-track cover MP4 generated successfully at " + destFile.getAbsolutePath()
-                    + " (" + width + "x" + height + ", " + destFile.length() + "B, " + cost + "ms)");
+                    + " (" + width + "x" + height + ", " + (fadeFrames + 1) + " frames"
+                    + (yuvFrom == null ? ", no fade" : ", fading in over " + (fadeFrames - 1)
+                    + " frames") + ", " + destFile.length() + "B, " + cost + "ms)");
             return true;
 
         } catch (Throwable t) {
@@ -257,6 +300,11 @@ public class CoverVideoEncoder {
             if (scaledBitmap != null && scaledBitmap != bitmap) {
                 try {
                     scaledBitmap.recycle();
+                } catch (Throwable ignored) {}
+            }
+            if (scaledFrom != null && scaledFrom != from) {
+                try {
+                    scaledFrom.recycle();
                 } catch (Throwable ignored) {}
             }
             if (encoder != null) {
@@ -280,6 +328,119 @@ public class CoverVideoEncoder {
 
     public static String getCachedVideoPath() {
         return sCachedVideoPath;
+    }
+
+    /** The muxer plumbing that has to live across frames: the track, whether it is open, and whether the stream has ended. */
+    private static final class Sink {
+        MediaMuxer muxer;
+        int track = -1;
+        boolean started;
+        boolean eos;
+    }
+
+    /**
+     * Moves whatever the encoder has produced into the muxer.
+     *
+     * The end of the stream is remembered ON THE SINK (`sink.eos`), not returned once: this is
+     * called both per frame and at the end, and the per-frame call after the last frame can be
+     * the one that sees EOS. The first version returned "done" and the caller, not knowing EOS
+     * had already been consumed, called the final drain again - which then waited four seconds
+     * for a second end-of-stream that no codec will ever send, failed the encode, and deleted
+     * the one good cover video on the device with it.
+     *
+     * `untilEos` keeps waiting through INFO_TRY_AGAIN_LATER until the end-of-stream flag has
+     * been seen, which is what the end of an encode is. Without it the call takes what is ready
+     * and returns, which is what keeps the input buffers flowing while a fade is being fed frame
+     * by frame - the codec holds a handful of them, and a twelve-frame fade is more frames than
+     * that.
+     *
+     * @return false if the encode cannot continue (nothing came out for three seconds, a format
+     *         that changed twice, or a sample before the muxer opened)
+     */
+    private static boolean drain(MediaCodec encoder, Sink sink, MediaCodec.BufferInfo info,
+                                 boolean untilEos, long startedAt) {
+        while (!sink.eos) {
+            int outputIndex = encoder.dequeueOutputBuffer(info, TIMEOUT_US);
+            if (outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                if (!untilEos) return true;
+                if (startedAt == 0) startedAt = SystemClock.uptimeMillis();
+                if ((SystemClock.uptimeMillis() - startedAt) > 3000L) {
+                    Xp.log(TAG + "drain: nothing came out for 3000ms");
+                    return false;
+                }
+            } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (sink.started) {
+                    Xp.log(TAG + "drain: the format changed twice");
+                    return false;
+                }
+                sink.track = sink.muxer.addTrack(encoder.getOutputFormat());
+                sink.muxer.start();
+                sink.started = true;
+            } else if (outputIndex >= 0) {
+                ByteBuffer outputBuffer = encoder.getOutputBuffer(outputIndex);
+                boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                if (outputBuffer != null) {
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        info.size = 0;
+                    }
+                    if (info.size != 0) {
+                        if (!sink.started) {
+                            Xp.log(TAG + "drain: a sample arrived before the muxer opened");
+                            return false;
+                        }
+                        outputBuffer.position(info.offset);
+                        outputBuffer.limit(info.offset + info.size);
+                        sink.muxer.writeSampleData(sink.track, outputBuffer, info);
+                    }
+                }
+                // Released whether or not the buffer came out null: a skipped release parks a
+                // codec buffer for good, and the next dequeue then waits on a codec that has
+                // none left to give.
+                encoder.releaseOutputBuffer(outputIndex, false);
+                if (eos) sink.eos = true;
+            }
+        }
+        return true;
+    }
+
+    /** `b` in the encoder's own colour space, ready to be fed. Converted once per picture. */
+    private static byte[] toYuv(Bitmap b, int width, int height, int colorFormat) {
+        int[] argb = new int[width * height];
+        b.getPixels(argb, 0, width, 0, 0, width, height);
+        byte[] yuv = new byte[width * height * 3 / 2];
+        if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
+            encodeYUV420P(yuv, argb, width, height);
+        } else {
+            encodeYUV420SP(yuv, argb, width, height);
+        }
+        return yuv;
+    }
+
+    /**
+     * One frame of the walk: `a` at t=0, `b` at t=1.
+     *
+     * Straight through in YUV, which is where both ends already are and where the codec reads
+     * them. Blending the bitmaps and converting the result per frame would be a full-screen RGB
+     * walk plus a full-screen conversion for each frame, for a picture the encoder is about to
+     * subsample anyway; this is one pass over the planes. Integer, because the planes are
+     * unsigned bytes and a fixed-point multiply is exact enough for a fifth-of-a-second
+     * dissolve.
+     */
+    private static void fillFrame(byte[] out, byte[] a, byte[] b, float t) {
+        if (a == null || t >= 1f) {
+            System.arraycopy(b, 0, out, 0, out.length);
+            return;
+        }
+        if (t <= 0f) {
+            System.arraycopy(a, 0, out, 0, out.length);
+            return;
+        }
+        final int scale = Math.round(t * 4096f);
+        for (int i = 0; i < out.length; i++) {
+            int x = a[i] & 0xFF;
+            int y = b[i] & 0xFF;
+            out[i] = (byte) ((x + (((y - x) * scale) >> 12)) & 0xFF);
+        }
     }
 
     public static long computeBitmapChecksum(Bitmap bitmap) {

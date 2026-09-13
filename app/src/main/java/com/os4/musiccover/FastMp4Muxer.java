@@ -76,6 +76,86 @@ public class FastMp4Muxer {
         return null;
     }
 
+    /** The gpmd sample period the OEM's own template carries, kept as it is. */
+    private static final int GPMD_SAMPLE_DELTA = 1500;
+
+    /**
+     * The OEM's gpmd track, at the right sample count.
+     *
+     * The template is Xiaomi's own depth track with a two-sample table in it, and the parts of it
+     * that depend on how long the picture is are the parts rebuilt here: stsz's count, stts's one
+     * run, and stco's offsets - one gpmd sample interleaved in front of each video sample, which
+     * is the pairing the template was written for.
+     *
+     * Everything else is the OEM's and is left exactly as it is: the timescale, the durations
+     * (which were never tied to the picture anyway - its own file pairs a 33ms gpmd track with a
+     * 100ms video and works), the GoPro MET sample entry, the edit list. Only count-dependent
+     * boxes are touched, and mdhd's duration is kept equal to the stts total so the two do not
+     * disagree about a track that got longer.
+     *
+     * At two samples this reproduces the old in-place patch byte for byte, which is the shape
+     * every cover video had before the fade existed - that is what the offline check compares.
+     *
+     * @return the rebuilt trak, or null if the template is not the shape this expects
+     */
+    private static byte[] rebuildGpmdTrak(byte[] trak0, int[] absOffsets) {
+        Box mdia = findBox(parseBoxes(trak0, 8, trak0.length), "mdia");
+        if (mdia == null) return null;
+        Box minf = findBox(parseBoxes(trak0, mdia.offset + 8, mdia.offset + mdia.size), "minf");
+        if (minf == null) return null;
+        Box stbl = findBox(parseBoxes(trak0, minf.offset + 8, minf.offset + minf.size), "stbl");
+        if (stbl == null) return null;
+        List<Box> stblBoxes = parseBoxes(trak0, stbl.offset + 8, stbl.offset + stbl.size);
+        Box stts = findBox(stblBoxes, "stts");
+        Box stsz = findBox(stblBoxes, "stsz");
+        Box stco = findBox(stblBoxes, "stco");
+        if (stts == null || stsz == null || stco == null) return null;
+
+        int n = absOffsets.length;
+        ByteBuffer src = ByteBuffer.wrap(trak0).order(ByteOrder.BIG_ENDIAN);
+
+        byte[] newStts = new byte[24];
+        ByteBuffer.wrap(newStts).order(ByteOrder.BIG_ENDIAN)
+                .putInt(24).put("stts".getBytes(StandardCharsets.ISO_8859_1))
+                .putInt(0).putInt(1)
+                .putInt(n).putInt(GPMD_SAMPLE_DELTA);
+
+        // The template states the mask's size once (sample_size = 5), so only the count moves.
+        byte[] newStsz = new byte[20];
+        ByteBuffer.wrap(newStsz).order(ByteOrder.BIG_ENDIAN)
+                .putInt(20).put("stsz".getBytes(StandardCharsets.ISO_8859_1))
+                .putInt(0).putInt(GPMD_NULL_MASK.length).putInt(n);
+
+        byte[] newStco = new byte[16 + 4 * n];
+        ByteBuffer stcoBuf = ByteBuffer.wrap(newStco).order(ByteOrder.BIG_ENDIAN);
+        stcoBuf.putInt(newStco.length).put("stco".getBytes(StandardCharsets.ISO_8859_1))
+                .putInt(0).putInt(n);
+        for (int i = 0; i < n; i++) stcoBuf.putInt(absOffsets[i]);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(trak0, 0, stts.offset);
+        out.write(newStts, 0, newStts.length);
+        out.write(trak0, stts.offset + stts.size, stsz.offset - (stts.offset + stts.size));
+        out.write(newStsz, 0, newStsz.length);
+        out.write(trak0, stsz.offset + stsz.size, stco.offset - (stsz.offset + stsz.size));
+        out.write(newStco, 0, newStco.length);
+        out.write(trak0, stco.offset + stco.size, trak0.length - (stco.offset + stco.size));
+        byte[] built = out.toByteArray();
+
+        int delta = built.length - trak0.length;
+        ByteBuffer dst = ByteBuffer.wrap(built).order(ByteOrder.BIG_ENDIAN);
+        dst.putInt(0, built.length);
+        dst.putInt(stbl.offset, src.getInt(stbl.offset) + delta);
+        dst.putInt(minf.offset, src.getInt(minf.offset) + delta);
+        dst.putInt(mdia.offset, src.getInt(mdia.offset) + delta);
+
+        Box mdhd = findBox(parseBoxes(trak0, mdia.offset + 8, mdia.offset + mdia.size), "mdhd");
+        if (mdhd != null && (trak0[mdhd.offset + 8] & 0xFF) == 0) {
+            dst.putInt(mdhd.offset + 24, n * GPMD_SAMPLE_DELTA);
+        }
+        return built;
+    }
+
     /**
      * Converts a single-track video MP4 file into a dual-track (gpmd + video) MP4 file.
      *
@@ -157,55 +237,91 @@ public class FastMp4Muxer {
                 return false;
             }
 
-            // Read sample sizes from stsz
+            // Read the sample table as a table, not as "the first two samples".
+            //
+            // This used to read sample 0 and 1 and interleave exactly those, which was the shape
+            // of the cover video until it had a fade in it: two identical frames and no third.
+            // A fade needs more samples than that, so the offsets are expanded here from stsc
+            // and the chunk offsets - the spec's own table, which is what makes this independent
+            // of how MediaMuxer chose to pack the samples into chunks - and the sizes come from
+            // stsz. Anything the table does not cover is refused rather than mis-muxed, because
+            // a wrong offset is a file the player opens and renders as garbage.
+            int fixedSampleSize = buf.getInt(stsz.offset + 12);
             int sampleCount = buf.getInt(stsz.offset + 16);
             if (sampleCount < 1) {
                 Xp.log(TAG + "no samples found in stsz");
                 return false;
             }
+            int[] sampleSizes = new int[sampleCount];
+            for (int i = 0; i < sampleCount; i++) {
+                sampleSizes[i] = fixedSampleSize != 0
+                        ? fixedSampleSize
+                        : buf.getInt(stsz.offset + 20 + 4 * i);
+            }
 
-            int sample0Sz = buf.getInt(stsz.offset + 20);
-            int sample1Sz = (sampleCount > 1) ? buf.getInt(stsz.offset + 24) : 0;
-
-            // Read chunk offsets from chunkBox (stco / co64)
             int chunkCount = buf.getInt(chunkBox.offset + 12);
-            long chunk0Offset;
-            long chunk1Offset;
-            if (chunkBox.type.equals("co64")) {
-                chunk0Offset = buf.getLong(chunkBox.offset + 16);
-                chunk1Offset = (chunkCount > 1) ? buf.getLong(chunkBox.offset + 24) : (chunk0Offset + sample0Sz);
-            } else {
-                chunk0Offset = buf.getInt(chunkBox.offset + 16) & 0xFFFFFFFFL;
-                chunk1Offset = (chunkCount > 1) ? (buf.getInt(chunkBox.offset + 20) & 0xFFFFFFFFL) : (chunk0Offset + sample0Sz);
+            int stscEntries = buf.getInt(stsc.offset + 12);
+            if (chunkCount < 1 || stscEntries < 1) {
+                Xp.log(TAG + "refusing: " + chunkCount + " chunks, " + stscEntries + " stsc entries");
+                return false;
+            }
+            int[] stscFirst = new int[stscEntries];
+            int[] stscPerChunk = new int[stscEntries];
+            for (int e = 0; e < stscEntries; e++) {
+                int base = stsc.offset + 16 + 12 * e;
+                stscFirst[e] = buf.getInt(base);
+                stscPerChunk[e] = buf.getInt(base + 4);
+                if (stscPerChunk[e] < 1) {
+                    Xp.log(TAG + "refusing: stsc entry " + e + " says " + stscPerChunk[e]
+                            + " samples per chunk");
+                    return false;
+                }
             }
 
-            // Video sample bytes from single
-            byte[] rawS0 = new byte[sample0Sz];
-            System.arraycopy(single, (int) chunk0Offset, rawS0, 0, sample0Sz);
-
-            byte[] rawS1 = null;
-            if (sample1Sz > 0) {
-                rawS1 = new byte[sample1Sz];
-                System.arraycopy(single, (int) chunk1Offset, rawS1, 0, sample1Sz);
+            long[] srcOffsets = new long[sampleCount];
+            int sample = 0;
+            for (int c = 0; c < chunkCount && sample < sampleCount; c++) {
+                int perChunk = stscPerChunk[0];
+                for (int e = stscEntries - 1; e >= 0; e--) {
+                    if (c + 1 >= stscFirst[e]) {
+                        perChunk = stscPerChunk[e];
+                        break;
+                    }
+                }
+                long offset = chunkBox.type.equals("co64")
+                        ? buf.getLong(chunkBox.offset + 16 + 8 * c)
+                        : (buf.getInt(chunkBox.offset + 16 + 4 * c) & 0xFFFFFFFFL);
+                for (int k = 0; k < perChunk && sample < sampleCount; k++) {
+                    srcOffsets[sample] = offset;
+                    offset += sampleSizes[sample];
+                    sample++;
+                }
+            }
+            if (sample != sampleCount) {
+                Xp.log(TAG + "refusing: the sample table covers " + sample + " of " + sampleCount
+                        + " samples");
+                return false;
+            }
+            for (int i = 0; i < sampleCount; i++) {
+                if (srcOffsets[i] + sampleSizes[i] > fileLen) {
+                    Xp.log(TAG + "sample " + i + " runs past the end of the file");
+                    return false;
+                }
             }
 
-            // 1. Build new mdat payload: interleave gpmd with video frames
+            // 1. Build new mdat payload: interleave gpmd with the video frames.
+            //
+            // Absolute offsets as they are built, because they are what both tracks' stco end up
+            // holding: ftyp comes first, and every sample sits 8 bytes into its mdat box.
+            int absMdatStart = ftyp.size;
             ByteArrayOutputStream newMdatStream = new ByteArrayOutputStream();
-            int relOffGpmd0 = newMdatStream.size() + 8; // relative to mdat box start
-            newMdatStream.write(GPMD_NULL_MASK);
-
-            int relOffV0 = newMdatStream.size() + 8;
-            newMdatStream.write(rawS0);
-
-            int relOffGpmd1 = newMdatStream.size() + 8;
-            newMdatStream.write(GPMD_NULL_MASK);
-
-            int relOffV1 = newMdatStream.size() + 8;
-            if (rawS1 != null) {
-                newMdatStream.write(rawS1);
-            } else {
-                relOffV1 = relOffV0;
-                relOffGpmd1 = relOffGpmd0;
+            int[] absGpmdOffsets = new int[sampleCount];
+            int[] absVideoOffsets = new int[sampleCount];
+            for (int i = 0; i < sampleCount; i++) {
+                absGpmdOffsets[i] = absMdatStart + newMdatStream.size() + 8;
+                newMdatStream.write(GPMD_NULL_MASK);
+                absVideoOffsets[i] = absMdatStart + newMdatStream.size() + 8;
+                newMdatStream.write(single, (int) srcOffsets[i], sampleSizes[i]);
             }
 
             byte[] newMdatPayload = newMdatStream.toByteArray();
@@ -214,27 +330,15 @@ public class FastMp4Muxer {
                     .putInt(newMdatPayload.length + 8)
                     .put("mdat".getBytes(StandardCharsets.ISO_8859_1));
 
-            // Absolute offsets in final MP4 (ftyp comes first)
-            int absMdatStart = ftyp.size;
-            int absOffGpmd0 = absMdatStart + relOffGpmd0;
-            int absOffGpmd1 = absMdatStart + relOffGpmd1;
-            int absOffV0 = absMdatStart + relOffV0;
-            int absOffV1 = absMdatStart + relOffV1;
-
-            // 2. Prepare trak0 from Base64 template
+            // 2. Track 0, rebuilt for this many samples. Its counts are the only part of the
+            //    OEM's template that depends on the length of the picture, so they are the only
+            //    part that is rewritten - see rebuildGpmdTrak().
             byte[] trak0 = Base64.getDecoder().decode(TRAK0_BASE64);
-            List<Box> t0Top = parseBoxes(trak0, 8, trak0.length);
-            Box t0Mdia = findBox(t0Top, "mdia");
-            Box t0Minf = findBox(parseBoxes(trak0, t0Mdia.offset + 8, t0Mdia.offset + t0Mdia.size), "minf");
-            Box t0Stbl = findBox(parseBoxes(trak0, t0Minf.offset + 8, t0Minf.offset + t0Minf.size), "stbl");
-            Box t0Stco = findBox(parseBoxes(trak0, t0Stbl.offset + 8, t0Stbl.offset + t0Stbl.size), "stco");
-            if (t0Stco == null) {
-                Xp.log(TAG + "stco not found in trak0 template");
+            byte[] newTrak0 = rebuildGpmdTrak(trak0, absGpmdOffsets);
+            if (newTrak0 == null) {
+                Xp.log(TAG + "cannot rebuild the gpmd track for " + sampleCount + " samples");
                 return false;
             }
-            ByteBuffer.wrap(trak0).order(ByteOrder.BIG_ENDIAN)
-                    .putInt(t0Stco.offset + 16, absOffGpmd0)
-                    .putInt(t0Stco.offset + 20, absOffGpmd1);
 
             // 3. Prepare trak1 (video) from single
             byte[] trakData = new byte[trak.size];
@@ -252,12 +356,14 @@ public class FastMp4Muxer {
                     .putInt(0).putInt(1)
                     .putInt(1).putInt(1).putInt(1);
 
-            // Rebuild stco: 2 entries (absOffV0, absOffV1)
-            byte[] newStco = new byte[24];
-            ByteBuffer.wrap(newStco).order(ByteOrder.BIG_ENDIAN)
-                    .putInt(24).put("stco".getBytes(StandardCharsets.ISO_8859_1))
-                    .putInt(0).putInt(2)
-                    .putInt(absOffV0).putInt(absOffV1);
+            // Rebuild stco: one entry per sample
+            byte[] newStco = new byte[16 + 4 * sampleCount];
+            ByteBuffer newStcoBuf = ByteBuffer.wrap(newStco).order(ByteOrder.BIG_ENDIAN);
+            newStcoBuf.putInt(newStco.length).put("stco".getBytes(StandardCharsets.ISO_8859_1))
+                    .putInt(0).putInt(sampleCount);
+            for (int i = 0; i < sampleCount; i++) {
+                newStcoBuf.putInt(absVideoOffsets[i]);
+            }
 
             // Replace stsc and chunkBox in trakData
             int relStsc = stsc.offset - trakRelOffset;
@@ -294,7 +400,7 @@ public class FastMp4Muxer {
             // 5. Assemble moov
             ByteArrayOutputStream moovStream = new ByteArrayOutputStream();
             moovStream.write(mvhdData);
-            moovStream.write(trak0);
+            moovStream.write(newTrak0);
             moovStream.write(newTrak1);
             byte[] newMoovPayload = moovStream.toByteArray();
 
