@@ -1499,36 +1499,47 @@ public class WallpaperProbe {
         return 0;
     }
 
+    /**
+     * Within this distance of the end, a play-once wallpaper counts as finished. The player
+     * reports about the duration while parked on its last frame, and "saved position + the
+     * cover's hold time" lands here once the video would have run out behind the cover -
+     * either way the right restore is the last frame, HELD, not the ending replayed.
+     */
+    private static final long END_ZONE_MS = 150L;
+    /** Where a finished wallpaper parks: inside the final frame, so none of the tail plays. */
+    private static final long PARK_FROM_END_MS = 40L;
+
     private static void restoreVideoPosition(Object eng, long posUs) {
         if (posUs <= 0 || eng == null) return;
         long posMs = posUs / 1000L;
         // Advance the saved position by the time the cover was up: the wallpaper is expected
-        // to resume where it would have been had it kept looping behind the cover - not
-        // frozen at the takeover frame. Wrapped by the source video's own duration; without
-        // a duration the saved position is used as-is.
+        // to resume where it would have been had it kept running behind the cover - not
+        // frozen at the takeover frame. Without a duration the saved position is used as-is.
         long elapsedMs = SystemClock.uptimeMillis() - sSavedVideoAtMs;
-        if (elapsedMs > 500L) {
-            long durMs = sourceVideoDurationMs(eng);
-            if (durMs > 0) {
-                // The user's wallpaper plays ONCE and stops at its end (播完即停) - it does
-                // not loop. The resumed position therefore advances by the cover's hold time
-                // and CLAMPS at the last frame: a wallpaper that reached its end stays parked
-                // there instead of wrapping into an early cycle.
-                long advanced = Math.min(posMs + elapsedMs, durMs - 50L);
-                advanced = Math.max(advanced, 0);
-                if (advanced != posMs) {
-                    Xp.log(TAG + "restore position: saved " + posMs + "ms + cover held "
-                            + elapsedMs + "ms -> " + advanced + "ms (source " + durMs + "ms,"
-                            + " play-once)");
-                }
-                posMs = advanced;
-            }
+        long targetMs = posMs;
+        long durMs = sourceVideoDurationMs(eng);
+        if (elapsedMs > 500L && durMs > 0) {
+            targetMs = posMs + elapsedMs;
+            Xp.log(TAG + "restore position: saved " + posMs + "ms + cover held "
+                    + elapsedMs + "ms -> " + targetMs + "ms (source " + durMs + "ms,"
+                    + " play-once)");
         }
-        if (isDepthEngine(eng)) {
-            restoreDepthVideoPosition(eng, posMs * 1000L);
+        // The user's wallpaper plays ONCE and stops at its end (播完即停). A target in the end
+        // zone means the video had finished - before the cover took over, or while it was up.
+        // The old clamp to duration-50 sought NEAR the end and let the engine's own start()
+        // run, so every restore of a finished wallpaper visibly replayed the ending; park on
+        // the last frame instead and nothing of the tail moves.
+        if (durMs > 0 && targetMs >= durMs - END_ZONE_MS) {
+            Xp.log(TAG + "restore position: " + targetMs + "ms of " + durMs + "ms is the end"
+                    + " - parking on the last frame instead of replaying the tail");
+            parkVideoAtEnd(eng, durMs);
             return;
         }
-        restorePlainVideoPosition(eng, posMs);
+        if (isDepthEngine(eng)) {
+            restoreDepthVideoPosition(eng, targetMs * 1000L);
+            return;
+        }
+        restorePlainVideoPosition(eng, targetMs);
     }
 
     /** Duration of the user's own lock wallpaper video, for the resume-position advance. */
@@ -1554,20 +1565,89 @@ public class WallpaperProbe {
     }
 
     /**
-     * Resumes the plain video wallpaper from `posMs`. A single seek is not enough on the
-     * device: the rebuild may not have the player playable yet, and the impl's seek methods
-     * are R8-renamed, so one thrown call used to end the chain and the video silently
-     * restarted from 0. This retries - seek, read the position back, and only accept it when
-     * playback is actually parked at the target - across four attempts spread over 600ms,
-     * which is inside the first-frame wait the restore runs against.
+     * How far below the target a read-back has to be before a seek counts as lost. At or
+     * PAST the target is always success: playback has moved on, and seeking again is what
+     * snapped the wallpaper backwards to the same spot over and over.
+     */
+    private static final long SEEK_TOLERANCE_MS = 400L;
+    /** How long after a seek the read-back that judges it runs. */
+    private static final long SEEK_VERIFY_MS = 300L;
+    /** How long after the park seek the pause that holds it runs. */
+    private static final long PARK_PAUSE_MS = 150L;
+
+    /** The plain engine's VideoPlayer (field e, a FastPlayerImpl), or null. */
+    private static Object plainVideoPlayer(Object eng) {
+        if (eng == null) return null;
+        try {
+            return Xp.getObjectField(eng, "e");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The native FastPlayer under the plain engine's player (field t), or null. */
+    private static Object plainFastPlayer(Object eng) {
+        try {
+            Object player = plainVideoPlayer(eng);
+            return player == null ? null : Xp.getObjectField(player, "t");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The plain engine's playback position in ms, or -1 when there is nothing readable. */
+    private static long plainPositionMs(Object eng) {
+        try {
+            Object fp = plainFastPlayer(eng);
+            if (fp != null) return (Long) Xp.callMethod(fp, "getCurrentPosition");
+        } catch (Throwable ignored) {
+        }
+        return -1L;
+    }
+
+    /**
+     * One seek on the plain engine: the impl's R8-named seek methods first, the native
+     * player's own seekto as the fallback. An accepted call can still be dropped by the
+     * native side while the player is preparing - it is the readiness wait upstream that
+     * keeps that from happening, not this.
+     */
+    private static boolean seekPlainPlayer(Object eng, long posMs) {
+        Object player = plainVideoPlayer(eng);
+        if (player == null) return false;
+        try {
+            Xp.callMethod(player, "mo1345i", posMs);
+            return true;
+        } catch (Throwable ignored) {
+        }
+        try {
+            Xp.callMethod(player, "mo1047i", posMs);
+            return true;
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object fp = plainFastPlayer(eng);
+            if (fp != null) {
+                Xp.callMethod(fp, "seekto", 0.0f, posMs, 0);
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * Resumes the plain video wallpaper from `posMs` with ONE seek.
+     *
+     * The seek goes out only once the rebuilt player is actually rendering - position off
+     * zero, the same signal the first-frame notification to SystemUI waits on. A seek into
+     * a still-preparing player is dropped silently, and the previous fix for that - re-seek
+     * every 150ms until a read-back agreed - is what made the restore play from the target
+     * position several times: the rebuild takes 300-700ms, every attempt inside that window
+     * failed its read-back, and the queued seeks then landed one after another, each one
+     * snapping playback back to the same spot. So: wait for the first frame, seek once, and
+     * re-seek only when a read-back shows the position still far BELOW the target.
      */
     private static void restorePlainVideoPosition(Object eng, long posMs) {
-        // Resume from where the wallpaper was when the cover took it over. A single seek is
-        // not enough on the device: the rebuild may not have the player playable yet, and the
-        // impl's seek methods are R8-renamed, so one thrown call used to end the chain and the
-        // video silently restarted from 0. This retries - seek, read the position back, and
-        // only accept it when playback is actually parked at the target - across four attempts
-        // spread over 600ms, which is inside the first-frame wait the restore runs against.
         if (posMs <= 100) {
             Xp.log(TAG + "restorePlainVideoPosition: posMs=" + posMs + " is at the start,"
                     + " nothing to seek");
@@ -1575,78 +1655,121 @@ public class WallpaperProbe {
         }
         final long target = posMs;
         final Object engRef = eng;
+        final long startedAt = SystemClock.uptimeMillis();
         final int[] attempt = {0};
-        final Runnable[] seekTry = new Runnable[1];
-        seekTry[0] = new Runnable() {
+        final Runnable[] step = new Runnable[1];
+        step[0] = new Runnable() {
             @Override
             public void run() {
+                long at = plainPositionMs(engRef);
+                // Readiness waits on TIME alone. The counter below only counts real seeks -
+                // the first cut of this counted the 16ms polls too, so the budget was gone
+                // in ~50ms while the rebuild still had 300-700ms to run, the restore gave
+                // up without ever seeking, and the wallpaper replayed from its start on
+                // every single cover exit.
+                if (at <= 0
+                        && SystemClock.uptimeMillis() - startedAt < FIRST_FRAME_TIMEOUT_MS) {
+                    // Still rebuilding - the player has not rendered a frame yet. Wait;
+                    // a seek issued now is exactly the one that gets dropped.
+                    new Handler(Looper.getMainLooper()).postDelayed(step[0],
+                            FIRST_FRAME_POLL_MS);
+                    return;
+                }
+                if (at >= target - SEEK_TOLERANCE_MS) {
+                    Xp.log(TAG + "restorePlainVideoPosition: already at " + (at < 0 ? 0 : at)
+                            + "ms (target " + target + "), done");
+                    return;
+                }
                 int n = attempt[0]++;
-                if (n > 3) {
-                    Xp.log(TAG + "restorePlainVideoPosition: giving up after 4 attempts"
+                if (n > 2) {
+                    Xp.log(TAG + "restorePlainVideoPosition: giving up after 3 seeks"
                             + " (target " + target + "ms)");
                     return;
                 }
-                try {
-                    Object player = Xp.getObjectField(engRef, "e");
-                    if (player == null) {
-                        Xp.log(TAG + "restorePlainVideoPosition: no player yet (attempt " + n + ")");
-                        new Handler(Looper.getMainLooper()).postDelayed(seekTry[0], 200L);
+                seekPlainPlayer(engRef, target);
+                Xp.log(TAG + "restorePlainVideoPosition: attempt " + n + " seeked to "
+                        + target + "ms (was " + (at < 0 ? "not rendering yet" : at + "ms")
+                        + ")");
+                // One read-back. At or past the target is success even though playback has
+                // advanced beyond it - seeking again there would only jump it backwards.
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    long after = plainPositionMs(engRef);
+                    if (after >= target - SEEK_TOLERANCE_MS) {
+                        Xp.log(TAG + "restorePlainVideoPosition: parked at " + after
+                                + "ms (target " + target + ")");
                         return;
                     }
-                    long now = 0;
-                    Object fp = null;
-                    try {
-                        fp = Xp.getObjectField(player, "t");
-                        now = (Long) Xp.callMethod(fp, "getCurrentPosition");
-                    } catch (Throwable ignored) {
-                    }
-                    if (Math.abs(now - target) <= 400) {
-                        Xp.log(TAG + "restorePlainVideoPosition: already at " + now + "ms"
-                                + " (target " + target + "), done");
-                        return;
-                    }
-                    boolean sought = false;
-                    try {
-                        Xp.callMethod(player, "mo1345i", target);
-                        sought = true;
-                    } catch (Throwable ignored) {
-                    }
-                    if (!sought) {
-                        try {
-                            Xp.callMethod(player, "mo1047i", target);
-                            sought = true;
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    if (!sought && fp != null) {
-                        Xp.callMethod(fp, "seekto", 0.0f, target, 0);
-                        sought = true;
-                    }
-                    Xp.log(TAG + "restorePlainVideoPosition: attempt " + n + " seeked to "
-                            + target + "ms (was " + now + "ms)");
-                    // Verify with the position read-back; a seek issued before the player is
-                    // playable disappears silently, and this is what notices it.
-                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                        try {
-                            Object p2 = Xp.getObjectField(engRef, "e");
-                            Object fp2 = p2 == null ? null : Xp.getObjectField(p2, "t");
-                            long at = fp2 == null ? 0 : (Long) Xp.callMethod(fp2, "getCurrentPosition");
-                            if (Math.abs(at - target) <= 400) {
-                                Xp.log(TAG + "restorePlainVideoPosition: parked at " + at
-                                        + "ms after attempt " + n);
-                                return;
-                            }
-                            seekTry[0].run();
-                        } catch (Throwable t) {
-                            seekTry[0].run();
-                        }
-                    }, 150L);
-                } catch (Throwable t) {
-                    Xp.log(TAG + "restorePlainVideoPosition attempt failed: " + t);
-                }
+                    step[0].run();
+                }, SEEK_VERIFY_MS);
             }
         };
-        new Handler(Looper.getMainLooper()).post(seekTry[0]);
+        new Handler(Looper.getMainLooper()).post(step[0]);
+    }
+
+    /**
+     * Parks a finished wallpaper on its last frame: one seek just inside the end, then a
+     * pause so none of the tail plays.
+     *
+     * The engine's own rebuild starts playback from zero regardless, so a finished wallpaper
+     * plays from the top for the few hundred ms the rebuild needs - that part belongs to the
+     * rebuild, and the SystemUI side is still holding its cover view over the window while
+     * it runs. What this removes is the tail: from the park point a play-once player
+     * completes within a frame on its own, and the pause is what holds the last frame even
+     * if the source turns out to loop. Any later start() from the engine (showKeyguardWallpaper,
+     * onVisibilityChanged) resumes from the park point and completes just as fast.
+     */
+    private static void parkVideoAtEnd(Object eng, long durMs) {
+        final long parkMs = Math.max(durMs - PARK_FROM_END_MS, 1L);
+        if (isDepthEngine(eng)) {
+            restoreDepthVideoPosition(eng, parkMs * 1000L);
+            // Same park on the depth shape, best effort: the manager's own player, paused
+            // once its delayed seek has had time to land. A missed pause costs at most the
+            // last frame of motion before the play-once end stops it.
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                try {
+                    Object mgr = videoDepthManager(eng);
+                    Object fp = mgr == null ? null : Xp.getObjectField(mgr, "j");
+                    if (fp != null) {
+                        Xp.callMethod(fp, "pause");
+                        Xp.log(TAG + "park at end: depth player paused at " + parkMs + "ms");
+                    }
+                } catch (Throwable t) {
+                    Xp.log(TAG + "park at end: depth pause skipped: " + t);
+                }
+            }, 800L);
+            return;
+        }
+        final Object engRef = eng;
+        final long startedAt = SystemClock.uptimeMillis();
+        final Runnable[] step = new Runnable[1];
+        step[0] = new Runnable() {
+            @Override
+            public void run() {
+                long at = plainPositionMs(engRef);
+                if (at <= 0
+                        && SystemClock.uptimeMillis() - startedAt < FIRST_FRAME_TIMEOUT_MS) {
+                    new Handler(Looper.getMainLooper()).postDelayed(step[0],
+                            FIRST_FRAME_POLL_MS);
+                    return;
+                }
+                seekPlainPlayer(engRef, parkMs);
+                Xp.log(TAG + "park at end: seeked to " + parkMs + "ms (was "
+                        + (at < 0 ? "not rendering yet" : at + "ms") + ")");
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    try {
+                        Object fp = plainFastPlayer(engRef);
+                        if (fp != null) {
+                            Xp.callMethod(fp, "pause");
+                            Xp.log(TAG + "park at end: paused at "
+                                    + plainPositionMs(engRef) + "ms");
+                        }
+                    } catch (Throwable t) {
+                        Xp.log(TAG + "park at end: pause failed: " + t);
+                    }
+                }, PARK_PAUSE_MS);
+            }
+        };
+        new Handler(Looper.getMainLooper()).post(step[0]);
     }
 
     private static boolean isDesktopEngine(Object eng) {
