@@ -1182,15 +1182,11 @@ public class WallpaperProbe {
                                 + " videoEngine=" + sVideoEngine
                                 + " coverVideo=" + sCoverVideoActive
                                 + " coverSuspended=" + sCoverSuspended
-                                + " kgShowing=" + sKeyguardShowing
-                                + " pinned=" + sPathPinned);
-                        dumpVideoManager();
+                                + " kgShowing=" + sKeyguardShowing);
                     } else if ("keyguard_state".equals(op)) {
                         boolean showing = i.getBooleanExtra("showing", true);
                         Xp.log(TAG + "recv keyguard_state showing=" + showing);
                         onKeyguardStateChanged(sVideoEngine, showing, "broadcast");
-                    } else if ("vpath".equals(op)) {
-                        dumpVideoManager();
                     } else if ("vgl".equals(op)) {
                         videoWindowTakeover(i.getBooleanExtra("on", true));
                     } else {
@@ -1353,16 +1349,6 @@ public class WallpaperProbe {
     private static volatile int sZoomForcedHere;
     private static volatile String sCoverVideoPath;
     private static volatile long sCurrentArtChecksum;
-    /**
-     * The wallpaper's own playback path, held while cover mode has the manager's field.
-     *
-     * Read out of the field before we overwrite it rather than asked of the engine, because the
-     * engine's path getter is the thing we are shadowing - calling it while cover mode is on
-     * would hand back our own file.
-     */
-    private static volatile String sOriginalVideoPath;
-    /** Whether the manager's path field is currently ours rather than the wallpaper's. */
-    private static volatile boolean sPathPinned;
     private static final String COVER_VIDEO_FILE = "mc_cover.mp4";
     private static final java.util.concurrent.ExecutorService sVideoWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor();
@@ -1792,7 +1778,6 @@ public class WallpaperProbe {
                 sCoverSuspended = true;
                 sCoverVideoActive = false;
                 Xp.log(TAG + "onKeyguardStateChanged: suspending cover video on desktop, restoring desktop wallpaper");
-                restoreVideoPath(eng);
                 triggerVideoReload(eng);
                 if (sSavedVideoPositionUs > 0) {
                     restoreVideoPosition(eng, sSavedVideoPositionUs);
@@ -1808,7 +1793,6 @@ public class WallpaperProbe {
                     sCoverVideoActive = true;
                     Xp.log(TAG + "onKeyguardStateChanged: re-activating cover video for lockscreen on "
                             + eng.getClass().getSimpleName());
-                    pinVideoPath(eng);
                     triggerVideoReload(eng);
                 }
             }
@@ -1842,7 +1826,6 @@ public class WallpaperProbe {
             sCoverVideoActive = false;
             sCoverVideoPath = null;
             Xp.log(TAG + "videoWindowTakeover: restoring original video wallpaper");
-            restoreVideoPath(eng);
             triggerVideoReload(eng);
             if (sSavedVideoPositionUs > 0) {
                 restoreVideoPosition(eng, sSavedVideoPositionUs);
@@ -1926,9 +1909,6 @@ public class WallpaperProbe {
                                 sCoverSuspended = false;
                                 Xp.log(TAG + "videoWindowTakeover: cover video ready (" + videoFile.length()
                                         + "B), triggering reload on " + eng.getClass().getSimpleName());
-                                // Pin BEFORE the reload: the reload is what rebuilds the player, and it
-                                // reads the manager's cached path rather than our hooked getter.
-                                pinVideoPath(eng);
                                 triggerVideoReload(eng);
                             }
                         } else {
@@ -1999,14 +1979,8 @@ public class WallpaperProbe {
         }
     }
 
-    /**
-     * The wallpaper's own playback path, before cover mode ever wrote over the manager's copy of
-     * it - which is the state on the way IN, when pinVideoPath() has not run yet. Same lookup
-     * restoreVideoPath() falls back to, and the same obfuscated names.
-     */
+    /** The wallpaper's own playback path, as the service controller has it. */
     private static String wallpaperVideoPath(Object eng) {
-        String held = sOriginalVideoPath;
-        if (held != null) return held;
         try {
             Class<?> wsc = Xp.findClass("com.miui.miwallpaper.manager.WallpaperServiceController", sCl);
             Object ctrl = Xp.callStaticMethod(wsc, "m1417l");
@@ -2076,157 +2050,6 @@ public class WallpaperProbe {
         } catch (Throwable ignored) {
         }
         return null;
-    }
-
-    /**
-     * The one String field on the VideoDepthManager: the path its player is opened with.
-     *
-     * Found by TYPE, not by name. The name is R8's (`q` on OS4.0.0.35) and this module has been
-     * broken by a rename before, but there is exactly one String field on the class - the
-     * disassembly of VideoDepthEngineImpl.T() shows it written from the engine's own path
-     * getter and read by the method that opens the player - so the type is the stronger
-     * identity. Refuses rather than guesses if a build ever has two.
-     */
-    private static java.lang.reflect.Field videoPathField(Object mgr) {
-        if (mgr == null) return null;
-        java.lang.reflect.Field found = null;
-        for (java.lang.reflect.Field f : mgr.getClass().getDeclaredFields()) {
-            if (f.getType() != String.class || Modifier.isStatic(f.getModifiers())) continue;
-            if ("q".equals(f.getName())) {
-                f.setAccessible(true);
-                return f;
-            }
-            if (found != null) {
-                Xp.log(TAG + "vgl: " + mgr.getClass().getSimpleName() + " carries more than one "
-                        + "String field (" + found.getName() + ", " + f.getName()
-                        + ") - not guessing which is the path");
-                return null;
-            }
-            found = f;
-        }
-        if (found != null) found.setAccessible(true);
-        return found;
-    }
-
-    /** What the manager would open its player with right now. */
-    private static String videoPathFieldValue(Object mgr) {
-        java.lang.reflect.Field f = videoPathField(mgr);
-        if (f == null) return null;
-        try {
-            return (String) f.get(mgr);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /**
-     * Points the depth manager's cached playback path at `path`. Returns false if it could not.
-     *
-     * This is the fix for why the cover never appeared on this shape. The engine's own T() is
-     * the only writer of that field and the only caller of the path getter this module hooks,
-     * and onWallpaperUpdate - the reload we trigger - rebuilds the surfaces and the player
-     * WITHOUT re-running T(). Measured on the device: `releaseAndInitFastPlayer` ->
-     * `init fastplayer` -> `setDataSource path = /data/system/theme_magic/.../lock_wallpaper_video.mp4`,
-     * i.e. the intercepted path was loaded once and then thrown away on the next re-init, and
-     * the player kept the wallpaper's own video. Writing the field is what survives the reload.
-     */
-    private static boolean setVideoPath(Object mgr, String path) {
-        java.lang.reflect.Field f = videoPathField(mgr);
-        if (f == null) return false;
-        try {
-            f.set(mgr, path);
-            Xp.log(TAG + "vgl: playback path field " + f.getName() + " := " + path);
-            return true;
-        } catch (Throwable t) {
-            Xp.log(TAG + "vgl: cannot write the playback path field: " + t);
-            return false;
-        }
-    }
-
-    /**
-     * The depth manager as it actually stands, read off the live object.
-     *
-     * Exists because the paper trail on this shape is not enough to debug it with: the OEM's
-     * own `VideoDepthManager##setDataSource` line says which path the ENGINE handed over, and
-     * the question after that is always whether the manager's cached field still holds it. This
-     * is the one place both are visible at the same moment.
-     */
-    private static void dumpVideoManager() {
-        Object eng = sVideoEngine;
-        if (eng == null) {
-            Xp.log(TAG + "vmanager: no video engine captured");
-            return;
-        }
-        Object mgr = videoDepthManager(eng);
-        if (mgr == null) {
-            Xp.log(TAG + "vmanager: engine is " + eng.getClass().getSimpleName()
-                    + " with no VideoDepthManager (plain shape)");
-            return;
-        }
-        int surfaces = 0;
-        StringBuilder sb = new StringBuilder();
-        try {
-            for (java.lang.reflect.Field f : mgr.getClass().getDeclaredFields()) {
-                if (f.getType() != android.view.Surface.class || Modifier.isStatic(f.getModifiers())) {
-                    continue;
-                }
-                f.setAccessible(true);
-                Object v = f.get(mgr);
-                if (v != null) surfaces++;
-                if (sb.length() > 0) sb.append(", ");
-                sb.append(f.getName()).append(v == null ? "=null" : "=set");
-            }
-        } catch (Throwable t) {
-            sb.append("unreadable: ").append(t);
-        }
-        Xp.log(TAG + "vmanager: " + mgr.getClass().getSimpleName()
-                + " surfaces=" + surfaces + "/6 [" + sb + "]"
-                + " cachedPath=" + describe(videoPathFieldValue(mgr))
-                + " originalPath=" + describe(sOriginalVideoPath)
-                + " pinned=" + sPathPinned);
-    }
-
-    /** Writes our cover file into the manager's cached path, remembering the wallpaper's own. */
-    private static void pinVideoPath(Object eng) {
-        Object mgr = videoDepthManager(eng);
-        if (mgr == null) {
-            // Not a failure on the plain shape, where the author's device works without this:
-            // there the reload does re-read the hooked getter.
-            Xp.log(TAG + "vgl: no VideoDepthManager - the path stays unpinned, so the cover "
-                    + "survives only if the engine re-reads its getter on the reload");
-            return;
-        }
-        String cur = videoPathFieldValue(mgr);
-        if (cur != null && !cur.equals(sCoverVideoPath)) {
-            sOriginalVideoPath = cur;
-            Xp.log(TAG + "vgl: remembered wallpaper's own playback path: " + sOriginalVideoPath);
-        }
-        sPathPinned = setVideoPath(mgr, sCoverVideoPath);
-    }
-
-    /** Puts the wallpaper's own path back. The reload that follows re-opens the player on it. */
-    private static void restoreVideoPath(Object eng) {
-        Object mgr = videoDepthManager(eng);
-        if (mgr == null) return;
-        String original = sOriginalVideoPath;
-        if (original == null || original.equals(sCoverVideoPath)) {
-            try {
-                Class<?> wsc = Xp.findClass("com.miui.miwallpaper.manager.WallpaperServiceController", sCl);
-                Object ctrl = Xp.callStaticMethod(wsc, "m1417l");
-                int which = eng.getClass().getName().contains("Desktop") ? 1 : 2;
-                original = (String) Xp.callMethod(ctrl, "m1457s", which, false);
-            } catch (Throwable ignored) {
-            }
-        }
-        if (original != null && !original.equals(sCoverVideoPath)) {
-            sOriginalVideoPath = original;
-            setVideoPath(mgr, original);
-            Xp.log(TAG + "vgl: restored video path: " + original);
-        } else {
-            Xp.log(TAG + "vgl: never learned the wallpaper's own path - the field still holds "
-                    + describe(videoPathFieldValue(mgr)) + ", leaving it alone");
-        }
-        sPathPinned = false;
     }
 
     /**
@@ -2348,10 +2171,7 @@ public class WallpaperProbe {
     private static void checkCoverVideo(final Object eng, final int which) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
-                Object mgr = videoDepthManager(eng);
                 Xp.log(TAG + "vcfade check: which=" + which
-                        + " cachedPath=" + describe(mgr == null ? null : videoPathFieldValue(mgr))
-                        + " original=" + describe(sOriginalVideoPath)
                         + " position=" + (getVideoPositionUs(eng) / 1000) + "ms"
                         + " ourFile=" + describe(sCoverVideoPath)
                         + " active=" + sCoverVideoActive);
