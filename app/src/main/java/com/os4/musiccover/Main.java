@@ -5150,8 +5150,6 @@ public class Main extends XposedModule {
         // The cover video's own crossfade is built in the wallpaper process out of this, so
         // whether to ask for it has to travel with the push. See sVideoFade.
         out.putExtra("vfade", sVideoFade);
-        // Everything has finished with it: the measurement, the clock recolour and the JPEG.
-        full.recycle();
         // By path, not by value, and that is not an optimisation.
         //
         // Measured on this phone: the largest cover in the library composes to 612KB, the
