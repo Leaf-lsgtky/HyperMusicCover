@@ -62,6 +62,10 @@ jobs:
 
       - uses: android-actions/setup-android@v3
         if: steps.check.outputs.publish == 'true'
+        # Only platform-tools: the action's default list names the removed "tools" package, which
+        # the runner's sdkmanager 16.0 refuses - see ci.yml.
+        with:
+          packages: 'platform-tools'
 
       - uses: gradle/actions/setup-gradle@v4
         if: steps.check.outputs.publish == 'true'

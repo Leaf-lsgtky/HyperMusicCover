@@ -49,16 +49,66 @@
             android:exported="true"
             android:theme="@style/Theme.HyperMusicCover"
             android:windowSoftInputMode="adjustResize">
+            <!-- What LSPosed looks for before it falls back to the launcher entry, so the manager
+                 can still open the app while the icon below is hidden. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            The desktop icon lives on an alias rather than on MainActivity, so hiding it disables
+            only this entry point and never the activity itself.
+        -->
+        <activity-alias
+            android:name=".LauncherAlias"
+            android:exported="true"
+            android:targetActivity=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <!-- The other way back in while the icon is hidden: dial *#*#95993926#*#*. Both actions,
+             as InstallerX registers them; the dialler decides which one it sends. -->
+        <receiver
+            android:name=".SecretCodeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telephony.action.SECRET_CODE" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="95993926" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SECRET_CODE" />
+                <data
+                    android:scheme="android_secret_code"
+                    android:host="95993926" />
+            </intent-filter>
+        </receiver>
 
         <activity
             android:name=".LicenseActivity"
             android:exported="false"
             android:label="@string/third_party_licenses_title"
+            android:theme="@style/Theme.HyperMusicCover" />
+
+        <!-- The features tab's two sub-screens, declared exactly like the licence list above:
+             an Activity each, so the platform supplies the transition and the back handling
+             rather than the features page imitating both. -->
+        <activity
+            android:name=".CoverActivity"
+            android:exported="false"
+            android:label="@string/features_cover_title"
+            android:theme="@style/Theme.HyperMusicCover" />
+
+        <activity
+            android:name=".ShadeActivity"
+            android:exported="false"
+            android:label="@string/features_shade_title"
             android:theme="@style/Theme.HyperMusicCover" />
 
         <!--

@@ -77,6 +77,8 @@ fun LockPreview(
     art: Bitmap?,
     bias: Float,
     clockHeightDp: Float,
+    clockSize: Float,
+    clockOffsetDp: Float,
     glassEnd: Float,
     geometry: ModuleBridge.Geometry,
     card: ModuleBridge.Shot?,
@@ -166,11 +168,14 @@ fun LockPreview(
             drawShot(rightShortcut, k)
             // The date is a sibling of the clock, not part of it: the phone scales the clock
             // group alone, so the date keeps its size whatever the size slider says.
-            drawShot(date, k)
+            // The offset moves the date and the clock together, in screen pixels.
+            val offset = clockOffsetDp.dp.toPx()
+            drawShot(date?.let { it.copy(t = it.t + offset.roundToInt()) }, k)
+            val scale = collapseScale(geometry, clockHeightDp, clockSize)
             if (clockHour == null && clockMinute == null) {
-                drawClockPlaceholder(k, geometry, clockHeightDp, glassEnd)
+                drawClockPlaceholder(k, geometry, scale, offset, glassEnd)
             } else {
-                drawClock(k, geometry, clockHeightDp, clockHour, clockMinute)
+                drawClock(k, geometry, scale, offset, clockHour, clockMinute)
             }
         }
     }
@@ -190,26 +195,26 @@ fun LockPreview(
 private fun DrawScope.drawClock(
     k: Float,
     geometry: ModuleBridge.Geometry,
-    clockHeightDp: Float,
+    clockScale: Float,
+    offset: Float,
     hour: Bitmap?,
     minute: Bitmap?,
 ) {
     if (!geometry.hasClock) return
-    val clockScale = collapseScale(geometry, clockHeightDp)
     val w = geometry.clockW * clockScale * k
     val h = geometry.clockH * clockScale * k
     // The phone's own transform, repeated: scale about (clockPivotX, clockY). Reproducing it
     // rather than centring means a left-aligned clock style stays left-aligned here too.
     val left = (geometry.clockPivotX
             + (geometry.clockX - geometry.clockPivotX) * clockScale) * k
-    val top = (geometry.clockY - geometry.clockPad * clockScale) * k
-    val offset = IntOffset(left.roundToInt(), top.roundToInt())
+    val top = (geometry.clockY + offset - geometry.clockPad * clockScale) * k
+    val at = IntOffset(left.roundToInt(), top.roundToInt())
     val dst = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1))
     for (b in listOf(hour, minute)) {
         if (b == null) continue
         drawImage(
             image = b.asImageBitmap(),
-            dstOffset = offset,
+            dstOffset = at,
             dstSize = dst,
             filterQuality = FilterQuality.High,
         )
@@ -228,13 +233,13 @@ private fun DrawScope.drawClock(
 private fun DrawScope.drawClockPlaceholder(
     k: Float,
     geometry: ModuleBridge.Geometry,
-    clockHeightDp: Float,
+    clockScale: Float,
+    offset: Float,
     glassEnd: Float,
 ) {
-    val clockScale = collapseScale(geometry, clockHeightDp)
     val boxW = (if (geometry.hasClock) geometry.clockW else FALLBACK_CLOCK_W) * clockScale * k
     val boxH = (if (geometry.hasClock) geometry.clockH else FALLBACK_CLOCK_H) * clockScale * k
-    val top = (if (geometry.clockY > 0f) geometry.clockY else FALLBACK_CLOCK_Y) * k
+    val top = ((if (geometry.clockY > 0f) geometry.clockY else FALLBACK_CLOCK_Y) + offset) * k
     if (boxW <= 0f || boxH <= 0f) return
     val left = if (geometry.hasClock && geometry.clockPivotX > 0f) {
         (geometry.clockPivotX + (geometry.clockX - geometry.clockPivotX) * clockScale) * k
@@ -513,14 +518,20 @@ private val SAMPLE_ART_SLOT = ModuleBridge.ArtSlot(
 )
 
 /**
- * The collapse scale the phone will apply, worked out the way the module works it out: the
- * height the slider asks for, over the height the captured glyphs actually measure. The capture
- * is cropped with the pad, so the pad comes back off before the division. Two lengths, so
- * nothing here needs the screen's density - which is what makes the slider portable.
+ * The collapse scale the phone will apply to the captured glyphs, worked out the way the module
+ * works it out. The size is a fraction of the style's full clock, and [ModuleBridge.Geometry.clockFull]
+ * is how much bigger that full clock is than the capture - so the two multiply. Without a size
+ * (an old module) it is the dp height over the height the captured glyphs measure.
  */
-private fun DrawScope.collapseScale(geometry: ModuleBridge.Geometry, heightDp: Float): Float {
+private fun DrawScope.collapseScale(
+    geometry: ModuleBridge.Geometry,
+    heightDp: Float,
+    size: Float,
+): Float {
     val glyphH = geometry.clockH - 2f * geometry.clockPad
     if (!geometry.hasClock || glyphH <= 0f) return FALLBACK_CLOCK_SCALE
+    val full = if (geometry.clockFull > 0f) geometry.clockFull else 1f
+    if (size > 0f) return size.coerceIn(MIN_CLOCK_SCALE, 1f) * full
     return (heightDp.dp.toPx() / glyphH).coerceIn(MIN_CLOCK_SCALE, 1f)
 }
 

@@ -1,22 +1,12 @@
 package com.os4.musiccover.ui.screen.features
 
+import android.content.Intent
 import android.graphics.Bitmap
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
-import androidx.compose.foundation.layout.add
-import androidx.compose.foundation.layout.displayCutout
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBars
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,9 +14,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
@@ -34,20 +22,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
+import com.os4.musiccover.CoverActivity
 import com.os4.musiccover.ModuleBridge
 import com.os4.musiccover.R
-import com.os4.musiccover.ui.util.BlurredBar
-import com.os4.musiccover.ui.util.pageScrollModifiers
-import com.os4.musiccover.ui.util.rememberBlurBackdrop
+import com.os4.musiccover.ShadeActivity
+import com.os4.musiccover.ui.util.PageScaffold
+import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
-import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.TabRow
-import top.yukonga.miuix.kmp.basic.TopAppBar
-import top.yukonga.miuix.kmp.blur.layerBackdrop
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -55,7 +40,78 @@ import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.basic.Text as MiuixText
 
 /**
- * Everything the module itself can be told to do, with a picture of the lock screen above it.
+ * The features tab: a card per feature, each opening a screen of its own.
+ *
+ * The tab lists rather than controls because its two subjects have nothing to do with each
+ * other - one is what the lock screen shows, the other is what happens over the desktop - and
+ * between them they are long enough that the second would have been buried under the first.
+ *
+ * Each card starts an Activity, which is what `AboutPage` does to reach the licence list and
+ * what `LicenseActivity` therefore already established as the house pattern for a sub-screen.
+ * The transition, the back gesture and the predictive-back animation on Android 13+ are the
+ * platform's; a sub-page swapped in place here would have had to imitate all three.
+ */
+@Composable
+fun FeaturesPageView(
+    isBlurEnabled: Boolean,
+    extraBottomPadding: Dp = 0.dp,
+) {
+    val context = LocalContext.current
+    FeatureList(isBlurEnabled, extraBottomPadding) { target ->
+        // An Activity, not a page swapped in place - the same thing AboutPage does to reach the
+        // licence list, and the reason is the transition: a whole screen arriving is the
+        // platform's own animation, it brings its own back handling, and nothing here has to
+        // imitate any of it. A sub-page animated inside this one only ever approximates that.
+        context.startActivity(Intent(context, target))
+    }
+}
+
+/**
+ * The tab itself: one card per feature, each opening a screen of its own.
+ *
+ * This used to BE the lock screen page. It became a list when the notification shade arrived,
+ * because the two have nothing to do with each other - one is what the lock screen shows, the
+ * other is what happens over the desktop - and between them they are long enough that the second
+ * would have been buried under the first.
+ */
+@Composable
+private fun FeatureList(
+    isBlurEnabled: Boolean,
+    extraBottomPadding: Dp,
+    onOpen: (Class<*>) -> Unit,
+) {
+    PageScaffold(
+        title = stringResource(R.string.tab_features),
+        isBlurEnabled = isBlurEnabled,
+        extraBottomPadding = extraBottomPadding,
+    ) {
+        item {
+            Column {
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
+                    ArrowPreference(
+                        title = stringResource(R.string.features_cover_title),
+                        summary = stringResource(R.string.features_cover_summary),
+                        onClick = { onOpen(CoverActivity::class.java) },
+                    )
+                }
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
+                    ArrowPreference(
+                        title = stringResource(R.string.features_shade_title),
+                        summary = stringResource(R.string.features_shade_summary),
+                        onClick = { onOpen(ShadeActivity::class.java) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Everything the module can be told about the lock screen, with a picture of it above.
  *
  * These are not app preferences: each one is a command to the hook inside SystemUI, and the
  * values shown are the ones it reports back. The preview is drawn from the same values, so a
@@ -77,16 +133,13 @@ import top.yukonga.miuix.kmp.basic.Text as MiuixText
  * cover mode renders wrong - so the module does both on its own.
  */
 @Composable
-fun FeaturesPageView(
+internal fun CoverPageView(
     isBlurEnabled: Boolean,
     refreshKey: Int,
     extraBottomPadding: Dp = 0.dp,
+    onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    val scrollBehavior = MiuixScrollBehavior()
-    val backdrop = rememberBlurBackdrop()
-    val blurActive = isBlurEnabled && backdrop != null
-    val barColor = if (blurActive) Color.Transparent else MiuixTheme.colorScheme.surface
 
     var module by remember { mutableStateOf(ModuleBridge.State()) }
     var art by remember { mutableStateOf<Bitmap?>(null) }
@@ -139,9 +192,15 @@ fun FeaturesPageView(
                             clockPad = g.clockPad,
                             clockX = g.clockX,
                             clockPivotX = g.clockPivotX,
+                            clockFull = g.clockFull,
                         )
                     )
                 }
+            }
+            // Only while the slider has never been moved: the size is then the dp default in
+            // the style's terms, and it changes with the style. Once set, the slider owns it.
+            if (module.clockSize <= 0f && reply.clockSize > 0f) {
+                module = module.copy(clockSize = reply.clockSize)
             }
             shots = ModuleBridge.Preview(
                 card = reply.card ?: shots.card,
@@ -159,82 +218,62 @@ fun FeaturesPageView(
     }
 
     val enabled = module.alive
+    // The cover has one setting of its own, too few for a tab, and it is about the same picture
+    // the clock sits on - so the two share one. The lyrics get the third.
     val groups = listOf(
-        stringResource(R.string.cover_section),
-        stringResource(R.string.clock_section),
+        stringResource(R.string.cover_clock_section),
         stringResource(R.string.card_section),
+        stringResource(R.string.lyrics_section),
     )
 
-    Scaffold(
-        popupHost = { },
-        topBar = {
-            BlurredBar(backdrop, blurActive, scrollBehavior) {
-                TopAppBar(
-                    title = stringResource(R.string.tab_features),
-                    color = barColor,
-                    scrollBehavior = scrollBehavior,
-                )
-            }
+    PageScaffold(
+        title = stringResource(R.string.features_cover_title),
+        isBlurEnabled = isBlurEnabled,
+        extraBottomPadding = extraBottomPadding,
+        onBack = onBack,
+        pinned = {
+            Spacer(Modifier.height(24.dp))
+            LockPreview(
+                art = art,
+                bias = module.bias,
+                clockHeightDp = module.clockHeightDp,
+                clockSize = module.clockSize,
+                clockOffsetDp = module.clockOffsetDp,
+                glassEnd = module.glassEnd,
+                geometry = module.geometry,
+                card = shots.card,
+                cardRadius = shots.cardRadius,
+                artSlot = shots.artSlot,
+                cardHideArt = module.mcHideArt,
+                cardCenterText = module.mcCenterText,
+                clockHour = shots.clockHour,
+                clockMinute = shots.clockMinute,
+                date = shots.date,
+                leftShortcut = shots.left,
+                rightShortcut = shots.right,
+            )
+            Spacer(Modifier.height(12.dp))
+            TabRow(
+                tabs = groups,
+                selectedTabIndex = group,
+                onTabSelected = { group = it },
+                modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp),
+            )
         },
-        contentWindowInsets = WindowInsets.systemBars.add(WindowInsets.displayCutout)
-            .only(WindowInsetsSides.Horizontal),
-    ) { innerPadding ->
-        Box(modifier = if (blurActive) Modifier.layerBackdrop(backdrop) else Modifier) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(top = innerPadding.calculateTopPadding()),
-                horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        item {
+            Card(
+                modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
             ) {
-                Spacer(Modifier.height(24.dp))
-                LockPreview(
-                    art = art,
-                    bias = module.bias,
-                    clockHeightDp = module.clockHeightDp,
-                    glassEnd = module.glassEnd,
-                    geometry = module.geometry,
-                    card = shots.card,
-                    cardRadius = shots.cardRadius,
-                    artSlot = shots.artSlot,
-                    cardHideArt = module.mcHideArt,
-                    cardCenterText = module.mcCenterText,
-                    clockHour = shots.clockHour,
-                    clockMinute = shots.clockMinute,
-                    date = shots.date,
-                    leftShortcut = shots.left,
-                    rightShortcut = shots.right,
-                )
-                Spacer(Modifier.height(12.dp))
-                TabRow(
-                    tabs = groups,
-                    selectedTabIndex = group,
-                    onTabSelected = { group = it },
-                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp),
-                )
-                LazyColumn(
-                    overscrollEffect = null,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pageScrollModifiers(
-                            showTopAppBar = true,
-                            topAppBarScrollBehavior = scrollBehavior,
-                        ),
-                    contentPadding = PaddingValues(
-                        bottom = innerPadding.calculateBottomPadding() + extraBottomPadding,
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    item {
-                        Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-                            when (group) {
-                                0 -> CoverGroup(enabled, module) { module = it }
-                                1 -> ClockGroup(enabled, module) { module = it }
-                                else -> CardGroup(enabled, module, { module = it }) {
-                                    shotNonce++
-                                }
-                            }
-                        }
+                when (group) {
+                    0 -> Column {
+                        CoverGroup(enabled, module) { module = it }
+                        ClockGroup(enabled, module) { module = it }
                     }
+                    1 -> CardGroup(enabled, module, { module = it }) {
+                        shotNonce++
+                    }
+                    else -> LyricsGroup(enabled, module) { module = it }
                 }
             }
         }
@@ -269,32 +308,35 @@ private fun ClockGroup(
 ) {
     val context = LocalContext.current
     Column {
-        // The top of the slider is the style's own size, whatever that is.
-        //
-        // Asking for a taller clock than the style draws is asking for it to grow, and the
-        // module refuses that: kForBox() caps the scale at 1, so a digit already shorter than
-        // the setting is left alone. Travel above the glyph height is therefore dead - the
-        // thumb moves and the clock does not - and the old fixed 64dp top cut the styles with
-        // taller digits off from the top of their own range, which is the one setting that
-        // means "do not collapse me at all". The magazine style, already 38dp, stops at 38; a
-        // style whose digits are 149dp rides to 149.
-        val maxDp = with(LocalDensity.current) {
-            val glyph = module.geometry.clockH - 2f * module.geometry.clockPad
-            if (module.geometry.hasClock && glyph > 0f) {
-                glyph.toDp().value.coerceAtLeast(CLOCK_HEIGHT_MIN_DP + 2f)
-            } else {
-                CLOCK_HEIGHT_MAX_DP
-            }
-        }
+        // Where the date and the clock sit, moved as one block from where cover mode puts them.
         ValueSlider(
             title = stringResource(R.string.clock_height),
             summary = stringResource(R.string.clock_height_summary),
-            value = module.clockHeightDp.coerceIn(CLOCK_HEIGHT_MIN_DP, maxDp),
-            valueRange = CLOCK_HEIGHT_MIN_DP..maxDp,
+            value = module.clockOffsetDp.coerceIn(CLOCK_OFFSET_MIN_DP, CLOCK_OFFSET_MAX_DP),
+            valueRange = CLOCK_OFFSET_MIN_DP..CLOCK_OFFSET_MAX_DP,
             enabled = enabled,
+            label = { "${it.roundToInt()} dp" },
             onValueChange = {
-                onChange(module.copy(clockHeightDp = it))
-                ModuleBridge.setClockHeight(context, it)
+                // Whole dp: a fraction of one is invisible, and the number reads cleaner.
+                val dp = it.roundToInt().toFloat()
+                onChange(module.copy(clockOffsetDp = dp))
+                ModuleBridge.setClockOffset(context, dp)
+            },
+        )
+        // A fraction of the style's own full clock, the one shown with cover mode off. The
+        // collapse cannot make a clock bigger than that, so 100% is the top.
+        ValueSlider(
+            title = stringResource(R.string.clock_size),
+            summary = stringResource(R.string.clock_size_summary),
+            value = (if (module.clockSize > 0f) module.clockSize else DEFAULT_CLOCK_SIZE)
+                .coerceIn(CLOCK_SIZE_MIN, 1f),
+            valueRange = CLOCK_SIZE_MIN..1f,
+            enabled = enabled,
+            label = { "${(it * 100f).roundToInt()}%" },
+            onValueChange = {
+                val size = (it * 100f).roundToInt() / 100f
+                onChange(module.copy(clockSize = size))
+                ModuleBridge.setClockSize(context, size)
             },
         )
         // The spring the whole transition runs on. The number is miuix's response time in
@@ -335,6 +377,47 @@ private fun ClockGroup(
                 val glassEnd = 1f - it
                 onChange(module.copy(glassEnd = glassEnd))
                 ModuleBridge.setGlassEnd(context, glassEnd)
+            },
+        )
+    }
+}
+
+@Composable
+private fun LyricsGroup(
+    enabled: Boolean,
+    module: ModuleBridge.State,
+    onChange: (ModuleBridge.State) -> Unit,
+) {
+    val context = LocalContext.current
+    Column {
+        SwitchPreference(
+            title = stringResource(R.string.lock_lyrics),
+            summary = stringResource(R.string.lock_lyrics_summary),
+            checked = module.lyrics,
+            enabled = enabled,
+            onCheckedChange = {
+                onChange(module.copy(lyrics = it))
+                ModuleBridge.setLyrics(context, it)
+            },
+        )
+        SwitchPreference(
+            title = stringResource(R.string.lyrics_hdr),
+            summary = stringResource(R.string.lyrics_hdr_summary),
+            checked = module.lyricsHdr,
+            enabled = enabled && module.lyrics,
+            onCheckedChange = {
+                onChange(module.copy(lyricsHdr = it))
+                ModuleBridge.setLyricsHdr(context, it)
+            },
+        )
+        SwitchPreference(
+            title = stringResource(R.string.lyrics_keep_on),
+            summary = stringResource(R.string.lyrics_keep_on_summary),
+            checked = module.lyricsKeepOn,
+            enabled = enabled && module.lyrics,
+            onCheckedChange = {
+                onChange(module.copy(lyricsKeepOn = it))
+                ModuleBridge.setLyricsKeepOn(context, it)
             },
         )
     }
@@ -422,19 +505,14 @@ private fun CardGroup(
     }
 }
 
-/**
- * A slider with its current value printed opposite the title. Without the number there is no way
- * to tell where you have dragged to, which matters here because these values get compared against
- * ones written down in the notes.
- */
-/** The collapsed clock's height in dp, matching DEFAULT_CLOCK_HEIGHT_DP in the module. */
-private const val CLOCK_HEIGHT_MIN_DP = 20f
-/**
- * Where the clock slider stops when there is no measured clock to take a size from - the module
- * has not reported one, or the style it reported draws no glyphs. A measured one gives its own
- * height instead, which is the real top of the range.
- */
-private const val CLOCK_HEIGHT_MAX_DP = 64f
+/** The date-and-clock offset's range in dp, matching CLOCK_OFFSET_MIN/MAX_DP in the module. */
+private const val CLOCK_OFFSET_MIN_DP = -60f
+private const val CLOCK_OFFSET_MAX_DP = 300f
+
+/** The clock size's floor, matching CLOCK_SIZE_MIN in the module. */
+private const val CLOCK_SIZE_MIN = 0.05f
+/** Where the size thumb sits before the module has said what the clock is at. */
+private const val DEFAULT_CLOCK_SIZE = 0.3f
 
 /**
  * The clock transition's spring response, in seconds, matching CLOCK_RESPONSE_MIN/MAX in the
@@ -444,13 +522,23 @@ private const val CLOCK_HEIGHT_MAX_DP = 64f
 private const val CLOCK_RESPONSE_MIN = 0.18f
 private const val CLOCK_RESPONSE_MAX = 0.60f
 
+/**
+ * A slider with its current value printed opposite the title. Without the number there is no way
+ * to tell where you have dragged to, which matters here because these values get compared against
+ * ones written down in the notes.
+ *
+ * Shared with ShadePage, which is why it is `internal` rather than private to this file: both
+ * pages adjust module settings the same way, and a second slider that looked almost the same was
+ * the first thing a reviewer noticed.
+ */
 @Composable
-private fun ValueSlider(
+internal fun ValueSlider(
     title: String,
     summary: String?,
     value: Float,
     valueRange: ClosedFloatingPointRange<Float>,
     enabled: Boolean,
+    label: (Float) -> String = ::format,
     onValueChange: (Float) -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -460,7 +548,7 @@ private fun ValueSlider(
             enabled = enabled,
             endActions = {
                 MiuixText(
-                    text = format(value),
+                    text = label(value),
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Medium,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -487,6 +575,7 @@ private fun clockGeometryOf(state: ModuleBridge.State) = ModuleBridge.Geometry(
     clockPad = state.geometry.clockPad,
     clockX = state.geometry.clockX,
     clockPivotX = state.geometry.clockPivotX,
+    clockFull = state.geometry.clockFull,
 )
 
 /**

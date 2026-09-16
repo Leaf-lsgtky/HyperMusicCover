@@ -8,19 +8,9 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
-import androidx.compose.foundation.layout.add
-import androidx.compose.foundation.layout.displayCutout
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.only
-import androidx.compose.foundation.layout.systemBars
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,20 +24,15 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.os4.musiccover.LauncherIcon
 import com.os4.musiccover.LocaleHelper
 import com.os4.musiccover.ModuleBridge
 import com.os4.musiccover.R
 import com.os4.musiccover.SettingsBackup
 import kotlinx.coroutines.launch
-import com.os4.musiccover.ui.util.BlurredBar
-import com.os4.musiccover.ui.util.pageScrollModifiers
-import com.os4.musiccover.ui.util.rememberBlurBackdrop
+import com.os4.musiccover.ui.util.PageScaffold
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
-import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTitle
-import top.yukonga.miuix.kmp.basic.TopAppBar
-import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
@@ -73,11 +58,6 @@ fun SettingsPageView(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
-    val scrollBehavior = MiuixScrollBehavior()
-
-    val backdrop = rememberBlurBackdrop()
-    val blurActive = isBlurEnabled && backdrop != null
-    val barColor = if (blurActive) Color.Transparent else MiuixTheme.colorScheme.surface
 
     val scope = rememberCoroutineScope()
 
@@ -137,177 +117,163 @@ fun SettingsPageView(
         }
     }
 
-    Scaffold(
-        popupHost = { },
-        topBar = {
-            BlurredBar(backdrop, blurActive, scrollBehavior) {
-                TopAppBar(
-                    title = stringResource(R.string.tab_settings),
-                    color = barColor,
-                    scrollBehavior = scrollBehavior,
-                )
-            }
-        },
-        contentWindowInsets = WindowInsets.systemBars.add(WindowInsets.displayCutout)
-            .only(WindowInsetsSides.Horizontal),
-    ) { innerPadding ->
-        Box(modifier = if (blurActive) Modifier.layerBackdrop(backdrop) else Modifier) {
-            LazyColumn(
-                overscrollEffect = null,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .pageScrollModifiers(
-                        showTopAppBar = true,
-                        topAppBarScrollBehavior = scrollBehavior,
-                    ),
-                contentPadding = PaddingValues(
-                    top = innerPadding.calculateTopPadding(),
-                    bottom = innerPadding.calculateBottomPadding() + extraBottomPadding,
-                ),
-            ) {
-                item {
+    PageScaffold(
+        title = stringResource(R.string.tab_settings),
+        isBlurEnabled = isBlurEnabled,
+        extraBottomPadding = extraBottomPadding,
+    ) {
+        item {
+            Column {
+                SmallTitle(text = stringResource(R.string.settings_update))
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
+                    SwitchPreference(
+                        title = stringResource(R.string.check_update),
+                        summary = stringResource(R.string.check_update_summary),
+                        checked = checkUpdate,
+                        onCheckedChange = onCheckUpdateChange
+                    )
+                }
+
+                SmallTitle(text = stringResource(R.string.settings_interface))
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
                     Column {
-                        SmallTitle(text = stringResource(R.string.settings_update))
-                        Card(
-                            modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                        val modes = listOf(
+                            stringResource(R.string.theme_system),
+                            stringResource(R.string.theme_light),
+                            stringResource(R.string.theme_dark),
+                            stringResource(R.string.theme_monet_system),
+                            stringResource(R.string.theme_monet_light),
+                            stringResource(R.string.theme_monet_dark)
+                        )
+                        val modesEnum = listOf(
+                            ColorSchemeMode.System,
+                            ColorSchemeMode.Light,
+                            ColorSchemeMode.Dark,
+                            ColorSchemeMode.MonetSystem,
+                            ColorSchemeMode.MonetLight,
+                            ColorSchemeMode.MonetDark
+                        )
+                        var expanded by remember { mutableStateOf(false) }
+                        val currentIndex =
+                            modesEnum.indexOf(currentMode).takeIf { it >= 0 } ?: 0
+
+                        WindowDropdownPreference(
+                            title = stringResource(R.string.theme_mode),
+                            summary = modes[currentIndex],
+                            items = modes,
+                            selectedIndex = currentIndex,
+                            onSelectedIndexChange = { onModeChange(modesEnum[it]) },
+                            onExpandedChange = { expanded = it }
+                        )
+
+                        SwitchPreference(
+                            title = stringResource(R.string.floating_navbar),
+                            summary = stringResource(R.string.floating_navbar_summary),
+                            checked = isFloatingNavbar,
+                            onCheckedChange = onFloatingNavbarChange
+                        )
+
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = isFloatingNavbar,
+                            enter = androidx.compose.animation.expandVertically(),
+                            exit = androidx.compose.animation.shrinkVertically(),
                         ) {
                             SwitchPreference(
-                                title = stringResource(R.string.check_update),
-                                summary = stringResource(R.string.check_update_summary),
-                                checked = checkUpdate,
-                                onCheckedChange = onCheckUpdateChange
+                                title = stringResource(R.string.liquid_glass),
+                                summary = stringResource(R.string.liquid_glass_summary),
+                                checked = isLiquidGlass,
+                                onCheckedChange = onLiquidGlassChange
                             )
                         }
 
-                        SmallTitle(text = stringResource(R.string.settings_interface))
-                        Card(
-                            modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
-                        ) {
-                            Column {
-                                val modes = listOf(
-                                    stringResource(R.string.theme_system),
-                                    stringResource(R.string.theme_light),
-                                    stringResource(R.string.theme_dark),
-                                    stringResource(R.string.theme_monet_system),
-                                    stringResource(R.string.theme_monet_light),
-                                    stringResource(R.string.theme_monet_dark)
-                                )
-                                val modesEnum = listOf(
-                                    ColorSchemeMode.System,
-                                    ColorSchemeMode.Light,
-                                    ColorSchemeMode.Dark,
-                                    ColorSchemeMode.MonetSystem,
-                                    ColorSchemeMode.MonetLight,
-                                    ColorSchemeMode.MonetDark
-                                )
-                                var expanded by remember { mutableStateOf(false) }
-                                val currentIndex =
-                                    modesEnum.indexOf(currentMode).takeIf { it >= 0 } ?: 0
+                        SwitchPreference(
+                            title = stringResource(R.string.blur_enabled),
+                            summary = stringResource(R.string.blur_enabled_summary),
+                            checked = isBlurEnabled,
+                            onCheckedChange = onBlurEnabledChange
+                        )
 
-                                WindowDropdownPreference(
-                                    title = stringResource(R.string.theme_mode),
-                                    summary = modes[currentIndex],
-                                    items = modes,
-                                    selectedIndex = currentIndex,
-                                    onSelectedIndexChange = { onModeChange(modesEnum[it]) },
-                                    onExpandedChange = { expanded = it }
-                                )
-
-                                SwitchPreference(
-                                    title = stringResource(R.string.floating_navbar),
-                                    summary = stringResource(R.string.floating_navbar_summary),
-                                    checked = isFloatingNavbar,
-                                    onCheckedChange = onFloatingNavbarChange
-                                )
-
-                                androidx.compose.animation.AnimatedVisibility(
-                                    visible = isFloatingNavbar,
-                                    enter = androidx.compose.animation.expandVertically(),
-                                    exit = androidx.compose.animation.shrinkVertically(),
-                                ) {
-                                    SwitchPreference(
-                                        title = stringResource(R.string.liquid_glass),
-                                        summary = stringResource(R.string.liquid_glass_summary),
-                                        checked = isLiquidGlass,
-                                        onCheckedChange = onLiquidGlassChange
-                                    )
-                                }
-
-                                SwitchPreference(
-                                    title = stringResource(R.string.blur_enabled),
-                                    summary = stringResource(R.string.blur_enabled_summary),
-                                    checked = isBlurEnabled,
-                                    onCheckedChange = onBlurEnabledChange
-                                )
+                        var iconHidden by remember { mutableStateOf(LauncherIcon.isHidden(context)) }
+                        SwitchPreference(
+                            title = stringResource(R.string.hide_launcher_icon),
+                            summary = stringResource(R.string.hide_launcher_icon_summary),
+                            checked = iconHidden,
+                            onCheckedChange = {
+                                LauncherIcon.setHidden(context, it)
+                                iconHidden = it
                             }
-                        }
-
-                        SmallTitle(text = stringResource(R.string.settings_language))
-                        Card(
-                            modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
-                        ) {
-                            val languageNames = listOf(
-                                stringResource(R.string.language_default),
-                                stringResource(R.string.language_zh_cn),
-                                stringResource(R.string.language_en)
-                            )
-                            val languageValues = listOf(
-                                LocaleHelper.Language.SYSTEM,
-                                LocaleHelper.Language.ZH_CN,
-                                LocaleHelper.Language.EN
-                            )
-                            val savedLanguage = LocaleHelper.getSavedLanguage(context)
-                            val langCurrentIndex =
-                                languageValues.indexOf(savedLanguage).takeIf { it >= 0 } ?: 0
-                            var langExpanded by remember { mutableStateOf(false) }
-
-                            WindowDropdownPreference(
-                                title = stringResource(R.string.settings_language),
-                                summary = languageNames[langCurrentIndex],
-                                items = languageNames,
-                                selectedIndex = langCurrentIndex,
-                                onSelectedIndexChange = {
-                                    LocaleHelper.setLanguage(context, languageValues[it])
-                                    activity?.recreate()
-                                },
-                                onExpandedChange = { langExpanded = it }
-                            )
-                        }
-
-                        SmallTitle(text = stringResource(R.string.settings_data))
-                        Card(
-                            modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
-                        ) {
-                            Column {
-                                ArrowPreference(
-                                    title = stringResource(R.string.export_settings),
-                                    summary = stringResource(R.string.export_settings_summary),
-                                    onClick = { exportLauncher.launch("HyperMusicCover_settings.json") }
-                                )
-                                ArrowPreference(
-                                    title = stringResource(R.string.import_settings),
-                                    summary = stringResource(R.string.import_settings_summary),
-                                    onClick = { importLauncher.launch("application/json") }
-                                )
-                                ArrowPreference(
-                                    title = stringResource(R.string.copy_report),
-                                    summary = stringResource(R.string.copy_report_summary),
-                                    onClick = { copyReport() }
-                                )
-                            }
-                        }
-
-                        MiuixText(
-                            text = "HyperMusicCover · zyl6932",
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            style = MiuixTheme.textStyles.footnote2,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 24.dp, bottom = 16.dp),
-                            textAlign = TextAlign.Center
                         )
                     }
                 }
+
+                SmallTitle(text = stringResource(R.string.settings_language))
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
+                    val languageNames = listOf(
+                        stringResource(R.string.language_default),
+                        stringResource(R.string.language_zh_cn),
+                        stringResource(R.string.language_en)
+                    )
+                    val languageValues = listOf(
+                        LocaleHelper.Language.SYSTEM,
+                        LocaleHelper.Language.ZH_CN,
+                        LocaleHelper.Language.EN
+                    )
+                    val savedLanguage = LocaleHelper.getSavedLanguage(context)
+                    val langCurrentIndex =
+                        languageValues.indexOf(savedLanguage).takeIf { it >= 0 } ?: 0
+                    var langExpanded by remember { mutableStateOf(false) }
+
+                    WindowDropdownPreference(
+                        title = stringResource(R.string.settings_language),
+                        summary = languageNames[langCurrentIndex],
+                        items = languageNames,
+                        selectedIndex = langCurrentIndex,
+                        onSelectedIndexChange = {
+                            LocaleHelper.setLanguage(context, languageValues[it])
+                            activity?.recreate()
+                        },
+                        onExpandedChange = { langExpanded = it }
+                    )
+                }
+
+                SmallTitle(text = stringResource(R.string.settings_data))
+                Card(
+                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                ) {
+                    Column {
+                        ArrowPreference(
+                            title = stringResource(R.string.export_settings),
+                            summary = stringResource(R.string.export_settings_summary),
+                            onClick = { exportLauncher.launch("HyperMusicCover_settings.json") }
+                        )
+                        ArrowPreference(
+                            title = stringResource(R.string.import_settings),
+                            summary = stringResource(R.string.import_settings_summary),
+                            onClick = { importLauncher.launch("application/json") }
+                        )
+                        ArrowPreference(
+                            title = stringResource(R.string.copy_report),
+                            summary = stringResource(R.string.copy_report_summary),
+                            onClick = { copyReport() }
+                        )
+                    }
+                }
+
+                MiuixText(
+                    text = "HyperMusicCover · zyl6932",
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    style = MiuixTheme.textStyles.footnote2,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 24.dp, bottom = 16.dp),
+                    textAlign = TextAlign.Center
+                )
             }
         }
     }

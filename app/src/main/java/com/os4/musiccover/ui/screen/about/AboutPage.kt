@@ -8,6 +8,8 @@
 package com.os4.musiccover.ui.screen.about
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -50,6 +52,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.os4.musiccover.BuildConfig
 import com.os4.musiccover.R
 import com.os4.musiccover.ui.component.effect.BgEffectBackground
 import com.os4.musiccover.ui.util.BlurredBar
@@ -74,6 +77,7 @@ import top.yukonga.miuix.kmp.blur.textureBlur
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
+import kotlin.math.abs
 import androidx.compose.ui.graphics.BlendMode as ComposeBlendMode
 import top.yukonga.miuix.kmp.basic.Text as MiuixText
 
@@ -81,12 +85,12 @@ import top.yukonga.miuix.kmp.basic.Text as MiuixText
 fun AboutPageContent(
     openLicensePage: () -> Unit,
     isBlurEnabled: Boolean = true,
-    refreshKey: Int = 0,
     checkUpdate: Boolean = true,
+    isCurrent: () -> Boolean = { true },
 ) {
     // Owns the check, the install and the four dialogs; see UpdateUi.kt. It has to sit above the
     // Scaffold because the dialogs open their own windows and cannot be nested in the page body.
-    val update = rememberUpdateController(refreshKey, checkUpdate)
+    val update = rememberUpdateController(isCurrent, checkUpdate)
     val topAppBarScrollBehavior = MiuixScrollBehavior()
     val lazyListState = rememberLazyListState()
 
@@ -143,6 +147,8 @@ fun AboutPageContent(
                 lazyListState = lazyListState,
                 scrollProgressProvider = { scrollProgress },
                 openLicensePage = openLicensePage,
+                isBlurEnabled = isBlurEnabled,
+                isCurrent = isCurrent,
                 update = update,
             )
         }
@@ -158,10 +164,17 @@ private fun AboutContent(
     lazyListState: LazyListState,
     scrollProgressProvider: () -> Float,
     openLicensePage: () -> Unit,
+    isBlurEnabled: Boolean,
+    isCurrent: () -> Boolean,
     update: UpdateController,
 ) {
     val uriHandler = LocalUriHandler.current
-    val contentBackdrop = rememberBlurBackdrop()
+    // `rememberBlurBackdrop` answers "can this device blur", not "did the user ask for it": on
+    // Android 13 and up it hands back a backdrop whatever the setting says. The gate has to be
+    // here. Everything below reads `contentBackdrop != null`, so with the setting off the layer
+    // was still recorded and the four textureBlur passes still ran - the page kept paying for a
+    // feature whose switch was off, and the switch was a lie.
+    val contentBackdrop = rememberBlurBackdrop()?.takeIf { isBlurEnabled }
     var blurRadius by remember { mutableFloatStateOf(60f) }
     var noiseCoefficient by remember { mutableFloatStateOf(BlurDefaults.NoiseCoefficient) }
     var brightness by remember { mutableFloatStateOf(0f) }
@@ -207,12 +220,18 @@ private fun AboutContent(
     var logoHeightDp by remember { mutableStateOf(300.dp) }
     val appName = stringResource(R.string.app_name)
     val ctx = LocalContext.current
-    val versionName = try {
-        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "1.0"
-    } catch (_: Exception) { "1.0" }
+    // BuildConfig rather than the installed package's metadata: it is the same string for this
+    // build, and it is not a call into the package manager on a composition that the pager can
+    // trigger at any time.
+    val versionName = BuildConfig.VERSION_NAME
 
     BgEffectBackground(
-        dynamicBackground = true,
+        // Only while this page is the one on screen. The pager keeps it composed for a whole tab
+        // away in either direction, and the background is a full-screen runtime shader whose
+        // animation loop invalidates draw every frame - so "composed" was costing a shader
+        // evaluation per frame, per enclosing layer, for the entire length of every trip between
+        // the first tab and this one. Off screen there is nothing to animate for.
+        dynamicBackground = isCurrent(),
         isFullSize = true,
         modifier = Modifier.fillMaxSize(),
         bgModifier = if (contentBackdrop != null) Modifier.layerBackdrop(contentBackdrop) else Modifier,
@@ -395,7 +414,12 @@ private fun AboutContent(
                     end = logoPadding.calculateRightPadding(LayoutDirection.Ltr),
                 )
                 .onSizeChanged { size ->
-                    with(density) { logoHeightDp = size.height.toDp() }
+                    // The spacer in the list reserves this height, so every write is a re-layout
+                    // of the list. Compose already drops a write of the same value; this also
+                    // drops one that differs by less than a pixel, which is the only way it can
+                    // differ without the logo having actually changed size.
+                    val measured = with(density) { size.height.toDp() }
+                    if (abs(measured.value - logoHeightDp.value) >= 1f) logoHeightDp = measured
                 },
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -460,6 +484,17 @@ private fun AboutContent(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 MiuixText(
+                    // The version is tappable for the same reason the "update available" line
+                    // below it is: the changelog is the one thing a person wants after seeing a
+                    // version number, and here it is one tap away. Indication stays off so the
+                    // press does not paint a band of shadow across the whole centred text.
+                    modifier = Modifier
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = { update.showVersionNotes() },
+                        )
+                        .padding(vertical = 4.dp),
                     color = colorScheme.onSurfaceVariantSummary,
                     text = versionName,
                     fontSize = 14.sp,

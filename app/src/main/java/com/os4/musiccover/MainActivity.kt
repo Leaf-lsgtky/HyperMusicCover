@@ -25,6 +25,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -232,7 +233,6 @@ private fun MainScreen(
     var selectedIndex by remember { mutableIntStateOf(0) }
     var isNavigating by remember { mutableStateOf(false) }
     var navJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    var refreshKey by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
     val items = listOf(
         stringResource(R.string.tab_home),
@@ -242,10 +242,28 @@ private fun MainScreen(
     )
     val icons = listOf(MiuixIcons.Home, MiuixIcons.Tune, MiuixIcons.Settings, MiuixIcons.Info)
 
+    /**
+     * One flag per page rather than one counter shared by all four.
+     *
+     * The pages re-ask the module when they come to the front, and a single counter bumped on
+     * every tab change made that *every* page: a tap re-composed and re-queried the pages nobody
+     * asked about, in the same frames the transition was trying to fill, and one of those queries
+     * is an ordered broadcast into SystemUI.
+     *
+     * `derivedStateOf` is what keeps it to the one page. Reading `pagerState.currentPage` from
+     * the page would make every page a subscriber to every page change; comparing it here and
+     * publishing only the answer means a page hears about it exactly when its own answer flips.
+     * The lambdas are remembered so the parameter is the same instance every recomposition -
+     * otherwise every page is unskippable and the split buys nothing.
+     */
+    val onHomePage = remember { derivedStateOf { pagerState.currentPage == 0 } }
+    val onAboutPage = remember { derivedStateOf { pagerState.currentPage == 3 } }
+    val isHomeCurrent: () -> Boolean = remember(onHomePage) { { onHomePage.value } }
+    val isAboutCurrent: () -> Boolean = remember(onAboutPage) { { onAboutPage.value } }
+
     LaunchedEffect(pagerState.currentPage) {
         if (!isNavigating && selectedIndex != pagerState.currentPage) {
             selectedIndex = pagerState.currentPage
-            refreshKey++
         }
     }
 
@@ -258,7 +276,6 @@ private fun MainScreen(
 
     fun goToPage(index: Int) {
         if (index == selectedIndex) return
-        refreshKey++
         navJob?.cancel()
         selectedIndex = index
         isNavigating = true
@@ -317,7 +334,10 @@ private fun MainScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .then(Modifier.layerBackdrop(backdrop))
+                // Gated on the setting, not just on the bar that samples it. Recording a layer
+                // is a second render of everything inside it, and with blur off nothing was
+                // reading this one - the bar had already switched to its opaque colour.
+                .then(if (isBlurEnabled) Modifier.layerBackdrop(backdrop) else Modifier)
                 .background(surfaceColor)
         ) {
             HorizontalPager(
@@ -329,13 +349,12 @@ private fun MainScreen(
                 when (page) {
                     0 -> HomePageView(
                         isBlurEnabled = isBlurEnabled,
-                        refreshKey = refreshKey,
+                        isCurrent = isHomeCurrent,
                         extraBottomPadding = navBarHeight,
                     )
 
                     1 -> FeaturesPageView(
                         isBlurEnabled = isBlurEnabled,
-                        refreshKey = refreshKey,
                         extraBottomPadding = navBarHeight,
                     )
 
@@ -358,8 +377,8 @@ private fun MainScreen(
                             context.startActivity(Intent(context, LicenseActivity::class.java))
                         },
                         isBlurEnabled = isBlurEnabled,
-                        refreshKey = refreshKey,
                         checkUpdate = checkUpdate,
+                        isCurrent = isAboutCurrent,
                     )
                 }
             }

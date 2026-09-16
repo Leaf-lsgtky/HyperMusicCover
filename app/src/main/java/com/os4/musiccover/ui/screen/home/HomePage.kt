@@ -13,22 +13,14 @@ import android.provider.Settings
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
-import androidx.compose.foundation.layout.add
-import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBars
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
@@ -49,14 +41,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.os4.musiccover.BuildConfig
 import com.os4.musiccover.ModuleBridge
 import com.os4.musiccover.R
 import com.os4.musiccover.ui.component.DropdownItem
 import com.os4.musiccover.ui.component.MenuPopupDefaults
-import com.os4.musiccover.ui.util.BlurredBar
+import com.os4.musiccover.ui.util.PageScaffold
 import com.os4.musiccover.ui.util.isInDarkTheme
-import com.os4.musiccover.ui.util.pageScrollModifiers
-import com.os4.musiccover.ui.util.rememberBlurBackdrop
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -70,8 +61,6 @@ import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTitle
-import top.yukonga.miuix.kmp.basic.TopAppBar
-import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.overlay.OverlayListPopup
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.PressFeedbackType
@@ -81,7 +70,7 @@ import top.yukonga.miuix.kmp.basic.Text as MiuixText
 @Composable
 fun HomePageView(
     isBlurEnabled: Boolean,
-    refreshKey: Int,
+    isCurrent: () -> Boolean,
     extraBottomPadding: Dp = 0.dp,
 ) {
     val context = LocalContext.current
@@ -89,20 +78,27 @@ fun HomePageView(
     val scrollBehavior = MiuixScrollBehavior()
     val title = stringResource(R.string.tab_home)
 
-    val deviceModel = Build.MODEL.ifEmpty { stringResource(R.string.home_unknown) }
-    val deviceName = Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
-        ?: deviceModel
-    val systemVersion = "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+    // These used to run on every re-composition, and two of them are not reads of this process:
+    // `Settings.Global` is a ContentProvider call into system_server and `getPackageInfo` was a
+    // PackageManager call into it as well. None of the answers can change while the app is up, so
+    // each is asked for once.
+    val unknown = stringResource(R.string.home_unknown)
+    val deviceModel = remember(unknown) { Build.MODEL.ifEmpty { unknown } }
+    val deviceName = remember(context, deviceModel) {
+        Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+            ?: deviceModel
+    }
+    val systemVersion = remember {
+        "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+    }
     val loadingText = stringResource(R.string.home_loading)
     var hyperOSVersion by remember { mutableStateOf(loadingText) }
     LaunchedEffect(Unit) {
         hyperOSVersion = withContext(Dispatchers.IO) { SystemVersion.hyperOs(loadingText) }
     }
-    val moduleVersion = "v" + try {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "0.0.1"
-    } catch (_: Exception) {
-        "0.0.1"
-    }
+    // BuildConfig rather than the installed package's metadata: it is the same string for this
+    // build and it costs nothing, where the package manager had to be asked every time.
+    val moduleVersion = "v" + BuildConfig.VERSION_NAME
 
     var state by remember { mutableStateOf(ModuleBridge.State()) }
     var checked by remember { mutableStateOf(false) }
@@ -114,213 +110,187 @@ fun HomePageView(
     }
 
     // The module can be enabled, disabled or restarted behind the app's back, so ask again every
-    // time this page comes to the front rather than caching the answer from launch.
-    LaunchedEffect(refreshKey) { refresh() }
+    // time this page comes to the front rather than caching the answer from launch. Keyed on the
+    // answer rather than on the pager: while this page is not the one on screen the effect is
+    // simply not running, so swiping past it does not cost a query into SystemUI.
+    val current = isCurrent()
+    LaunchedEffect(current) { if (current) refresh() }
 
-    val backdrop = rememberBlurBackdrop()
-    val blurActive = isBlurEnabled && backdrop != null
-    val barColor = if (blurActive) Color.Transparent else MiuixTheme.colorScheme.surface
-
-    Scaffold(
-        popupHost = { },
-        topBar = {
-            BlurredBar(backdrop, blurActive, scrollBehavior) {
-                TopAppBar(
-                    title = title,
-                    color = barColor,
-                    scrollBehavior = scrollBehavior,
-                    actions = { RestartMenu() },
-                )
-            }
-        },
-        contentWindowInsets = WindowInsets.systemBars.add(WindowInsets.displayCutout)
-            .only(WindowInsetsSides.Horizontal),
-    ) { innerPadding ->
-        Box(modifier = if (blurActive) Modifier.layerBackdrop(backdrop) else Modifier) {
-            LazyColumn(
-                overscrollEffect = null,
+    PageScaffold(
+        title = title,
+        isBlurEnabled = isBlurEnabled,
+        extraBottomPadding = extraBottomPadding,
+        actions = { RestartMenu() },
+    ) {
+        item {
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .pageScrollModifiers(
-                        showTopAppBar = true,
-                        topAppBarScrollBehavior = scrollBehavior,
-                    ),
-                contentPadding = PaddingValues(
-                    top = innerPadding.calculateTopPadding(),
-                    bottom = innerPadding.calculateBottomPadding() + extraBottomPadding
-                )
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp)
+                    .padding(top = 12.dp)
             ) {
-                item {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp)
-                            .padding(top = 12.dp)
-                    ) {
-                        val darkTheme = isInDarkTheme()
-                        val dynamicColor = MiuixTheme.isDynamicColor
-                        val ok = state.alive
-                        val statusColor = if (ok) {
-                            when {
-                                dynamicColor -> MiuixTheme.colorScheme.secondaryContainer
-                                darkTheme -> Color(0xFF1A3825)
-                                else -> Color(0xFFDFFAE4)
-                            }
-                        } else {
-                            when {
-                                dynamicColor -> MiuixTheme.colorScheme.errorContainer
-                                darkTheme -> Color(0xFF3D1C1C)
-                                else -> Color(0xFFFDE8E8)
-                            }
-                        }
-                        val iconTint = if (ok) {
-                            if (dynamicColor) MiuixTheme.colorScheme.primary.copy(alpha = 0.8f)
-                            else Color(0xFF36D167)
-                        } else {
-                            if (dynamicColor) MiuixTheme.colorScheme.error.copy(alpha = 0.8f)
-                            else Color(0xFFDC3545)
-                        }
-                        val titleText = if (ok) {
-                            stringResource(R.string.home_status_active)
-                        } else {
-                            stringResource(R.string.home_status_inactive)
-                        }
-                        // When it is working there is nothing to instruct the user about, so
-                        // the lines say what is running instead; when it is not, the hint is the
-                        // one thing worth reading.
-                        //
-                        // Neither line reacts to a re-check being in flight. Tapping the card
-                        // used to blank this one to "loading", and since a re-check keeps the
-                        // previous answer until the new one arrives, that was a flicker showing
-                        // nothing the previous answer had not already said.
-                        val lineTwo = if (checked && !ok) {
-                            stringResource(R.string.home_status_inactive_hint)
-                        } else {
-                            moduleVersion
-                        }
-                        // The card's bottom-left corner names the app, not the layout: there is
-                        // only one layout, so a line saying which one it is told the reader
-                        // nothing, while the name is what someone looking at a stranger's lock
-                        // screen would want to read off it. Null while the module is not live,
-                        // because then the hint above is the only line worth having.
-                        val workingMode = if (ok) {
-                            stringResource(R.string.app_name)
-                        } else {
-                            null
-                        }
+                val darkTheme = isInDarkTheme()
+                val dynamicColor = MiuixTheme.isDynamicColor
+                val ok = state.alive
+                val statusColor = if (ok) {
+                    when {
+                        dynamicColor -> MiuixTheme.colorScheme.secondaryContainer
+                        darkTheme -> Color(0xFF1A3825)
+                        else -> Color(0xFFDFFAE4)
+                    }
+                } else {
+                    when {
+                        dynamicColor -> MiuixTheme.colorScheme.errorContainer
+                        darkTheme -> Color(0xFF3D1C1C)
+                        else -> Color(0xFFFDE8E8)
+                    }
+                }
+                val iconTint = if (ok) {
+                    if (dynamicColor) MiuixTheme.colorScheme.primary.copy(alpha = 0.8f)
+                    else Color(0xFF36D167)
+                } else {
+                    if (dynamicColor) MiuixTheme.colorScheme.error.copy(alpha = 0.8f)
+                    else Color(0xFFDC3545)
+                }
+                val titleText = if (ok) {
+                    stringResource(R.string.home_status_active)
+                } else {
+                    stringResource(R.string.home_status_inactive)
+                }
+                // When it is working there is nothing to instruct the user about, so
+                // the lines say what is running instead; when it is not, the hint is the
+                // one thing worth reading.
+                //
+                // Neither line reacts to a re-check being in flight. Tapping the card
+                // used to blank this one to "loading", and since a re-check keeps the
+                // previous answer until the new one arrives, that was a flicker showing
+                // nothing the previous answer had not already said.
+                val lineTwo = if (checked && !ok) {
+                    stringResource(R.string.home_status_inactive_hint)
+                } else {
+                    moduleVersion
+                }
+                // The card's bottom-left corner names the app, not the layout: there is
+                // only one layout, so a line saying which one it is told the reader
+                // nothing, while the name is what someone looking at a stranger's lock
+                // screen would want to read off it. Null while the module is not live,
+                // because then the hint above is the only line worth having.
+                val workingMode = if (ok) {
+                    stringResource(R.string.app_name)
+                } else {
+                    null
+                }
 
-                        // Laid out the way KernelSU's HomeMiuix card is: three boxes stacked
-                        // on top of each other rather than three lines in a column. The title and
-                        // version sit top-left, the working mode is pinned bottom-left, and the
-                        // oversized icon bleeds off the bottom-right corner - the mode and the
-                        // icon balance each other diagonally, and the empty middle is what stops
-                        // it looking cramped. Stacking all three as a column instead put them in
-                        // a huddle at the top with the icon crowding them.
-                        //
-                        // The height comes from Row(IntrinsicSize.Min): the boxes inside all
-                        // fillMaxSize and so contribute none of their own, and without this the
-                        // card collapses to the height of the text.
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(IntrinsicSize.Min),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = CardDefaults.defaultColors(color = statusColor),
-                                onClick = { scope.launch { refresh() } },
-                                showIndication = true,
-                                pressFeedbackType = PressFeedbackType.Tilt
+                // Laid out the way KernelSU's HomeMiuix card is: three boxes stacked
+                // on top of each other rather than three lines in a column. The title and
+                // version sit top-left, the working mode is pinned bottom-left, and the
+                // oversized icon bleeds off the bottom-right corner - the mode and the
+                // icon balance each other diagonally, and the empty middle is what stops
+                // it looking cramped. Stacking all three as a column instead put them in
+                // a huddle at the top with the icon crowding them.
+                //
+                // The height comes from Row(IntrinsicSize.Min): the boxes inside all
+                // fillMaxSize and so contribute none of their own, and without this the
+                // card collapses to the height of the text.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(IntrinsicSize.Min),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.defaultColors(color = statusColor),
+                        onClick = { scope.launch { refresh() } },
+                        showIndication = true,
+                        pressFeedbackType = PressFeedbackType.Tilt
+                    ) {
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .offset(27.dp, 31.dp),
+                                contentAlignment = Alignment.BottomEnd
                             ) {
-                                Box {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .offset(27.dp, 31.dp),
-                                        contentAlignment = Alignment.BottomEnd
-                                    ) {
-                                        Icon(
-                                            modifier = Modifier.size(110.dp),
-                                            imageVector = if (ok) Icons.Rounded.CheckCircleOutline
-                                            else Icons.Rounded.ErrorOutline,
-                                            tint = iconTint,
-                                            contentDescription = null
-                                        )
-                                    }
-                                    if (workingMode != null) {
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .padding(16.dp, 10.dp),
-                                            contentAlignment = Alignment.BottomStart,
-                                        ) {
-                                            MiuixText(
-                                                text = workingMode,
-                                                fontSize = 16.sp,
-                                                fontWeight = FontWeight.Medium,
-                                            )
-                                        }
-                                    }
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .padding(16.dp, 14.dp),
-                                        contentAlignment = Alignment.TopStart,
-                                    ) {
-                                        Column {
-                                            MiuixText(
-                                                text = titleText,
-                                                fontSize = 22.sp,
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                            Spacer(Modifier.height(1.dp))
-                                            MiuixText(
-                                                text = lineTwo,
-                                                fontSize = 15.sp,
-                                            )
-                                        }
-                                    }
+                                Icon(
+                                    modifier = Modifier.size(110.dp),
+                                    imageVector = if (ok) Icons.Rounded.CheckCircleOutline
+                                    else Icons.Rounded.ErrorOutline,
+                                    tint = iconTint,
+                                    contentDescription = null
+                                )
+                            }
+                            if (workingMode != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp, 10.dp),
+                                    contentAlignment = Alignment.BottomStart,
+                                ) {
+                                    MiuixText(
+                                        text = workingMode,
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                }
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp, 14.dp),
+                                contentAlignment = Alignment.TopStart,
+                            ) {
+                                Column {
+                                    MiuixText(
+                                        text = titleText,
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Spacer(Modifier.height(1.dp))
+                                    MiuixText(
+                                        text = lineTwo,
+                                        fontSize = 15.sp,
+                                    )
                                 }
                             }
                         }
-
                     }
                 }
 
-                item {
-                    SmallTitle(
-                        text = stringResource(R.string.home_device_info),
-                        modifier = Modifier.padding(top = 12.dp)
+            }
+        }
+
+        item {
+            SmallTitle(
+                text = stringResource(R.string.home_device_info),
+                modifier = Modifier.padding(top = 12.dp)
+            )
+            Card(
+                modifier = Modifier
+                    .padding(horizontal = 12.dp)
+                    .padding(bottom = 12.dp)
+            ) {
+                Column {
+                    BasicComponent(
+                        title = stringResource(R.string.home_device_name),
+                        summary = deviceName,
                     )
-                    Card(
-                        modifier = Modifier
-                            .padding(horizontal = 12.dp)
-                            .padding(bottom = 12.dp)
-                    ) {
-                        Column {
-                            BasicComponent(
-                                title = stringResource(R.string.home_device_name),
-                                summary = deviceName,
-                            )
-                            BasicComponent(
-                                title = stringResource(R.string.home_device_model),
-                                summary = deviceModel,
-                            )
-                            BasicComponent(
-                                title = stringResource(R.string.home_hyperos_version),
-                                summary = hyperOSVersion,
-                            )
-                            BasicComponent(
-                                title = stringResource(R.string.home_android_version),
-                                summary = systemVersion,
-                            )
-                            BasicComponent(
-                                title = stringResource(R.string.home_module_version),
-                                summary = moduleVersion,
-                            )
-                        }
-                    }
+                    BasicComponent(
+                        title = stringResource(R.string.home_device_model),
+                        summary = deviceModel,
+                    )
+                    BasicComponent(
+                        title = stringResource(R.string.home_hyperos_version),
+                        summary = hyperOSVersion,
+                    )
+                    BasicComponent(
+                        title = stringResource(R.string.home_android_version),
+                        summary = systemVersion,
+                    )
+                    BasicComponent(
+                        title = stringResource(R.string.home_module_version),
+                        summary = moduleVersion,
+                    )
                 }
             }
         }

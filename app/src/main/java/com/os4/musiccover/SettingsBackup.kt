@@ -22,13 +22,21 @@ object SettingsBackup {
     private const val KEY_CLOCK_HEIGHT = "clockHeight"
     /** Written by versions that stored the collapse as a scale coefficient; read, never written. */
     private const val KEY_CLOCK_SCALE = "clockScale"
+    /** The size as a fraction of the style's full clock; absent while the slider was never set. */
+    private const val KEY_CLOCK_SIZE = "clockSizeFraction"
+    private const val KEY_CLOCK_OFFSET = "clockOffset"
     private const val KEY_CLOCK_RESPONSE = "clockResponse"
     private const val KEY_GLASS_END = "glassEnd"
     private const val KEY_CARD_HIDE_ART = "cardHideArt"
     private const val KEY_CARD_CENTER_TEXT = "cardCenterText"
     private const val KEY_CARD_TITLE_TAP = "cardTitleTap"
     private const val KEY_HIDE_FINGERPRINT = "hideFingerprint"
+    private const val KEY_LYRICS = "lyrics"
+    private const val KEY_LYRICS_KEEP_ON = "lyricsKeepOn"
+    private const val KEY_LYRICS_HDR = "lyricsHdr"
     private const val KEY_FP_AVOID = "fingerprintAvoid"
+    /** The whole notification-shade page, as one object keyed the way the module names them. */
+    private const val KEY_SHADE = "shade"
 
     suspend fun export(context: Context): String {
         val json = JSONObject(AppSettings.load(context).toJson())
@@ -38,13 +46,23 @@ object SettingsBackup {
         if (module.alive) {
             json.put(KEY_BIAS, module.bias.toDouble())
             json.put(KEY_CLOCK_HEIGHT, module.clockHeightDp.toDouble())
+            if (module.clockSize > 0f) json.put(KEY_CLOCK_SIZE, module.clockSize.toDouble())
+            json.put(KEY_CLOCK_OFFSET, module.clockOffsetDp.toDouble())
             json.put(KEY_CLOCK_RESPONSE, module.clockResponse.toDouble())
             json.put(KEY_GLASS_END, module.glassEnd.toDouble())
             json.put(KEY_CARD_HIDE_ART, module.mcHideArt)
             json.put(KEY_CARD_CENTER_TEXT, module.mcCenterText)
             json.put(KEY_CARD_TITLE_TAP, module.mcTitleTap)
             json.put(KEY_HIDE_FINGERPRINT, module.hideFingerprint)
+            json.put(KEY_LYRICS, module.lyrics)
+            json.put(KEY_LYRICS_KEEP_ON, module.lyricsKeepOn)
+            json.put(KEY_LYRICS_HDR, module.lyricsHdr)
             json.put(KEY_FP_AVOID, module.fpAvoid)
+            // Written whole rather than key by key, because the map is built from the module's
+            // own list of keys - this file has no idea what is in it, which is the point.
+            if (module.shade.isNotEmpty()) {
+                json.put(KEY_SHADE, JSONObject(module.shade as Map<*, *>))
+            }
         }
         return json.toString(2)
     }
@@ -64,6 +82,12 @@ object SettingsBackup {
                 else -> null
             }
             if (clock != null) ModuleBridge.setClockHeight(context, clock.toFloat())
+            if (obj.has(KEY_CLOCK_SIZE)) {
+                ModuleBridge.setClockSize(context, obj.getDouble(KEY_CLOCK_SIZE).toFloat())
+            }
+            if (obj.has(KEY_CLOCK_OFFSET)) {
+                ModuleBridge.setClockOffset(context, obj.getDouble(KEY_CLOCK_OFFSET).toFloat())
+            }
             if (obj.has(KEY_CLOCK_RESPONSE)) {
                 ModuleBridge.setClockResponse(context, obj.getDouble(KEY_CLOCK_RESPONSE).toFloat())
             }
@@ -82,8 +106,27 @@ object SettingsBackup {
             if (obj.has(KEY_HIDE_FINGERPRINT)) {
                 ModuleBridge.setHideFingerprint(context, obj.getBoolean(KEY_HIDE_FINGERPRINT))
             }
+            if (obj.has(KEY_LYRICS)) {
+                ModuleBridge.setLyrics(context, obj.getBoolean(KEY_LYRICS))
+            }
+            if (obj.has(KEY_LYRICS_HDR)) {
+                ModuleBridge.setLyricsHdr(context, obj.getBoolean(KEY_LYRICS_HDR))
+            }
+            if (obj.has(KEY_LYRICS_KEEP_ON)) {
+                ModuleBridge.setLyricsKeepOn(context, obj.getBoolean(KEY_LYRICS_KEEP_ON))
+            }
             if (obj.has(KEY_FP_AVOID)) {
                 ModuleBridge.setFingerprintAvoid(context, obj.getInt(KEY_FP_AVOID))
+            }
+            // EVERY key in the object, not a chosen few. A restore that puts back some of the
+            // shade page and leaves the rest at whatever this device happened to have is worse
+            // than one that puts back none of it: the result is a combination nobody chose and
+            // nothing on screen says so.
+            if (obj.has(KEY_SHADE)) {
+                val shade = obj.getJSONObject(KEY_SHADE)
+                for (key in shade.keys()) {
+                    ModuleBridge.setShade(context, key, shade.getInt(key))
+                }
             }
         } catch (_: Exception) {
             // The app half is already applied; a malformed module half is not worth losing it over.

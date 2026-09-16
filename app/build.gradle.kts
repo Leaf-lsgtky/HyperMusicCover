@@ -95,6 +95,11 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
 
+    // The lyric parser. Its classes end up in the same dex as Main.java's, so they are also
+    // loaded into SystemUI when the module is - see LyricProbe, which is why it has to stay
+    // dependency-light and Android-free.
+    implementation(libs.lyrics.core)
+
     // The release notes are Markdown and are rendered as such in the update dialog.
     implementation(libs.commonmark)
     implementation(libs.commonmark.ext.gfm.tables)

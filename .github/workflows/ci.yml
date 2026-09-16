@@ -33,8 +33,12 @@ jobs:
           java-version: '21'
 
       # Accepts the SDK licences so AGP may fetch compileSdk 37 by itself; the runner image
-      # does not ship a platform that new.
+      # does not ship a platform that new. Only platform-tools is asked for: the action's default
+      # list still names the long-removed "tools" package, which the runner's sdkmanager 16.0
+      # refuses outright - every run failed right here from 2026-09-15 on, before compiling.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       # Restores the Gradle and configuration caches, and writes a build summary.
       - uses: gradle/actions/setup-gradle@v4

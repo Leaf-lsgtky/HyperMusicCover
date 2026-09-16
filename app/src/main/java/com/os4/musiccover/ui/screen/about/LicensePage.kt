@@ -29,7 +29,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
@@ -37,17 +36,14 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.os4.musiccover.R
 import com.os4.musiccover.ui.util.BlurredBar
+import com.os4.musiccover.ui.util.PageBackButton
 import com.os4.musiccover.ui.util.pageScrollModifiers
 import com.os4.musiccover.ui.util.rememberBlurBackdrop
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.Icon
-import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.layerBackdrop
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 
@@ -74,19 +70,11 @@ fun LicensePageContent(
                     title = stringResource(R.string.third_party_licenses_title),
                     color = barColor,
                     scrollBehavior = topAppBarScrollBehavior,
-                    navigationIcon = {
-                        IconButton(onClick = onBack) {
-                            val layoutDirection = LocalLayoutDirection.current
-                            Icon(
-                                modifier = Modifier.graphicsLayer {
-                                    if (layoutDirection == LayoutDirection.Rtl) scaleX = -1f
-                                },
-                                imageVector = MiuixIcons.Back,
-                                contentDescription = stringResource(R.string.rules_cancel),
-                                tint = colorScheme.onBackground
-                            )
-                        }
-                    },
+                    // Shared with every other page that has a back arrow. This page keeps its
+                    // own Scaffold rather than using PageScaffold: its list is inset by the
+                    // display cutout on top of the window insets the frame already applies,
+                    // which no other page does.
+                    navigationIcon = { PageBackButton(onBack) },
                 )
             }
         },
