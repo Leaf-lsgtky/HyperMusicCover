@@ -3,5 +3,7 @@
     <string-array name="xposedscope">
         <item>com.android.systemui</item>
         <item>com.miui.miwallpaper</item>
+        <item>com.miui.aod</item>
+        <item>miui.systemui.plugin</item>
     </string-array>
 </resources>

@@ -236,7 +236,7 @@ fun rememberUpdateController(isCurrent: () -> Boolean, checkUpdate: Boolean): Up
 /**
  * `有可用更新：x.y.z`, and it is a button.
  *
- * InstallerX's About page has this same line as plain text, because it has nowhere to take a
+ * InstallerX Revived's About page has this same line as plain text, because it has nowhere to take a
  * tap: its release JSON never deserializes the notes and its update dialog is a pair of links out
  * to GitHub. Here the line is the way into the release notes, so the one thing a person wants
  * after reading "there is a new version" - what changed - is one tap away.
@@ -262,7 +262,7 @@ fun UpdateHint(modifier: Modifier = Modifier, update: UpdateInfo?, onShowNotes: 
     )
 }
 
-/** The two rows InstallerX has. */
+/** The two rows InstallerX Revived has. */
 @Composable
 fun UpdateRows(
     update: UpdateInfo?,
@@ -464,7 +464,7 @@ private fun UpdateNotesDialog(
     }
 }
 
-/** Where to get it by hand, kept as InstallerX has it: links out, and nothing about this build. */
+/** Where to get it by hand, kept as InstallerX Revived has it: links out, and nothing about this build. */
 @Composable
 private fun UpdateLinksDialog(show: Boolean, onDismiss: () -> Unit) {
     val context = LocalContext.current

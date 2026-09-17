@@ -31,7 +31,7 @@ object LauncherIcon {
     fun setHidden(context: Context, hidden: Boolean) {
         context.packageManager.setComponentEnabledSetting(
             component(context),
-            // ENABLED, not DEFAULT, as InstallerX does: going back to DEFAULT left the alias
+            // ENABLED, not DEFAULT, as InstallerX Revived does: going back to DEFAULT left the alias
             // resolvable but the HyperOS launcher never put the icon back.
             if (hidden) PackageManager.COMPONENT_ENABLED_STATE_DISABLED
             else PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
@@ -42,8 +42,15 @@ object LauncherIcon {
 }
 
 /**
- * Opens the app when [LauncherIcon.SECRET_CODE] is dialled, the same way InstallerX does. The
- * manifest filter already restricts the action and the code, so anything that arrives is ours.
+ * Opens the app when [LauncherIcon.SECRET_CODE] is dialled, where the dialler delivers to us.
+ *
+ * On this phone it never does, and the module in SystemUI answers the same broadcast instead -
+ * see `Main.registerSecretCode`, which also records what was measured. This is kept because the
+ * two do not conflict: where the dialler does deliver to an app, this is the shorter path and
+ * works without the module being enabled; where it does not, this simply never fires.
+ *
+ * The manifest filter already restricts the action and the code, so anything that arrives here
+ * is ours.
  */
 class SecretCodeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {

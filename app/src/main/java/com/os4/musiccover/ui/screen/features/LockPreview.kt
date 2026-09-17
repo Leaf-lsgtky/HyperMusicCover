@@ -85,7 +85,6 @@ fun LockPreview(
     cardRadius: Float,
     artSlot: ModuleBridge.ArtSlot?,
     cardHideArt: Boolean,
-    cardCenterText: Boolean,
     clockHour: Bitmap?,
     clockMinute: Bitmap?,
     date: ModuleBridge.Shot?,
@@ -102,16 +101,18 @@ fun LockPreview(
     // look like. Everything else - the clock, the date, the shortcuts - is live either way.
     val resources = LocalContext.current.resources
     val sampleCover = remember { BitmapFactory.decodeResource(resources, R.drawable.sample_cover) }
-    // A photograph cannot restyle itself, so the card was photographed in all four states the
-    // two switches can put it in and the switches pick one. Faking it does not work: hiding the
-    // thumbnail leaves the OEM's own placeholder note behind in the picture (the real card hides
-    // the whole artwork box, note and all), and centring the title moves a glyph run this side
-    // has no way to redraw.
-    val sampleCardRes = when {
-        cardHideArt && cardCenterText -> R.drawable.sample_card_no_art_centered
-        cardHideArt -> R.drawable.sample_card_no_art
-        cardCenterText -> R.drawable.sample_card_centered
-        else -> R.drawable.sample_card
+    // A photograph cannot restyle itself, so the card was photographed in the states it can be
+    // in and the switch picks one. Faking it does not work: hiding the thumbnail leaves the
+    // OEM's own placeholder note behind in the picture (the real card hides the whole artwork
+    // box, note and all), and centring the title moves a glyph run this side cannot redraw.
+    //
+    // Two photographs, not the four there used to be: centring is no longer a switch of its own,
+    // it follows the thumbnail, so "hidden and left-aligned" and "shown and centred" are states
+    // the card can no longer be in.
+    val sampleCardRes = if (cardHideArt) {
+        R.drawable.sample_card_no_art_centered
+    } else {
+        R.drawable.sample_card
     }
     val sampleCard = remember(sampleCardRes) {
         BitmapFactory.decodeResource(resources, sampleCardRes)

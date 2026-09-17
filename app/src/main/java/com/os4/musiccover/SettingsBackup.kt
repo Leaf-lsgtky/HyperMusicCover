@@ -28,9 +28,10 @@ object SettingsBackup {
     private const val KEY_CLOCK_RESPONSE = "clockResponse"
     private const val KEY_GLASS_END = "glassEnd"
     private const val KEY_CARD_HIDE_ART = "cardHideArt"
-    private const val KEY_CARD_CENTER_TEXT = "cardCenterText"
+    private const val KEY_CARD_ART_IN_LYRICS = "cardArtInLyrics"
     private const val KEY_CARD_TITLE_TAP = "cardTitleTap"
     private const val KEY_HIDE_FINGERPRINT = "hideFingerprint"
+    private const val KEY_FORCE_COLON = "forceClockColon"
     private const val KEY_LYRICS = "lyrics"
     private const val KEY_LYRICS_KEEP_ON = "lyricsKeepOn"
     private const val KEY_LYRICS_HDR = "lyricsHdr"
@@ -51,9 +52,10 @@ object SettingsBackup {
             json.put(KEY_CLOCK_RESPONSE, module.clockResponse.toDouble())
             json.put(KEY_GLASS_END, module.glassEnd.toDouble())
             json.put(KEY_CARD_HIDE_ART, module.mcHideArt)
-            json.put(KEY_CARD_CENTER_TEXT, module.mcCenterText)
+            json.put(KEY_CARD_ART_IN_LYRICS, module.mcArtInLyrics)
             json.put(KEY_CARD_TITLE_TAP, module.mcTitleTap)
             json.put(KEY_HIDE_FINGERPRINT, module.hideFingerprint)
+            json.put(KEY_FORCE_COLON, module.forceColon)
             json.put(KEY_LYRICS, module.lyrics)
             json.put(KEY_LYRICS_KEEP_ON, module.lyricsKeepOn)
             json.put(KEY_LYRICS_HDR, module.lyricsHdr)
@@ -97,14 +99,17 @@ object SettingsBackup {
             if (obj.has(KEY_CARD_HIDE_ART)) {
                 ModuleBridge.setCardHideArt(context, obj.getBoolean(KEY_CARD_HIDE_ART))
             }
-            if (obj.has(KEY_CARD_CENTER_TEXT)) {
-                ModuleBridge.setCardCenterText(context, obj.getBoolean(KEY_CARD_CENTER_TEXT))
+            if (obj.has(KEY_CARD_ART_IN_LYRICS)) {
+                ModuleBridge.setCardArtInLyrics(context, obj.getBoolean(KEY_CARD_ART_IN_LYRICS))
             }
             if (obj.has(KEY_CARD_TITLE_TAP)) {
                 ModuleBridge.setCardTitleTap(context, obj.getBoolean(KEY_CARD_TITLE_TAP))
             }
             if (obj.has(KEY_HIDE_FINGERPRINT)) {
                 ModuleBridge.setHideFingerprint(context, obj.getBoolean(KEY_HIDE_FINGERPRINT))
+            }
+            if (obj.has(KEY_FORCE_COLON)) {
+                ModuleBridge.setForceColon(context, obj.getBoolean(KEY_FORCE_COLON))
             }
             if (obj.has(KEY_LYRICS)) {
                 ModuleBridge.setLyrics(context, obj.getBoolean(KEY_LYRICS))

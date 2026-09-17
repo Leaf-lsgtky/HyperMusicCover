@@ -38,9 +38,41 @@ import java.util.concurrent.TimeUnit;
  */
 final class LyricSource {
 
+    /** Nothing was found, by any route. */
+    static final int SRC_NONE = 0;
+    /** The player published the whole lyric itself, or a provider module wrote it to the session. */
+    static final int SRC_LYRIC_INFO = 1;
+    /** The AMLL database, keyed by the platform's song id. */
+    static final int SRC_DATABASE = 2;
+    /** Found by name on NetEase - the fallback for a session carrying neither of the above. */
+    static final int SRC_NETEASE = 3;
+
     interface Callback {
-        /** Always called on the main thread. lines is never null; empty means nothing was found. */
-        void onLines(List<LyricLine> lines, String why);
+        /**
+         * Always called on the main thread. lines is never null; empty means nothing was found.
+         *
+         * `source` is one of the SRC_ constants and is not decoration: the session's own lyrics
+         * can arrive after the lyrics we settled for, and the caller upgrades to them when they
+         * do - which it can only do if it knows what it is currently showing.
+         */
+        void onLines(List<LyricLine> lines, String why, int source);
+    }
+
+    /**
+     * Whether the session is carrying a lyric worth using right now.
+     *
+     * Cheap enough to ask on every metadata change, which is what the caller does. A provider
+     * module cannot write its lyric until the player has told it what is playing, so the session
+     * routinely publishes lyricInfo a moment - or several seconds - after the track itself.
+     * Before that, the field is either absent or an explicit empty shell: MeiLoX publishes
+     * {"lyric":"","noLyric":true} while it is still looking.
+     */
+    static boolean hasLyricInfo(MediaController c) {
+        String info = lyricInfoOf(c);
+        if (info == null) {
+            return false;
+        }
+        return textOfLyricInfo(info) != null || rawOfLyricInfo(info) != null;
     }
 
     private LyricSource() {
@@ -132,23 +164,46 @@ final class LyricSource {
     }
 
     /**
-     * One directory per platform, each keyed by that platform's own song id.
+     * The one directory this player's ids belong in.
      *
-     * Which directory an id belongs in cannot be read off the number - a NetEase id and an Apple
-     * id are both plausible-looking integers - so the owning package is asked first and the rest
-     * are tried in order. Measured on this device: Apple Music publishes its store id in
-     * MEDIA_ID, and looking that up under ncm-lyrics finds nothing, which is exactly what a
-     * wrong-directory lookup looks like.
+     * One, not a list to work through. An id is only meaningful inside its own platform's
+     * namespace, and the package says which platform that is - Apple Music publishes an Apple
+     * store id, a NetEase client a NetEase id. Asking the other directories for it cannot
+     * succeed on purpose and can succeed by accident: the numbers are plain integers in the same
+     * range, so a collision returns a real, well-formed, completely unrelated song's lyrics with
+     * nothing to mark them as wrong. Silently wrong beats nothing only in a bug report.
+     *
+     * It was a list, and the cost was not only the risk: three directories meant three rounds of
+     * racing four mirrors each, every one of them a guaranteed miss for the two wrong ones, and
+     * the fallback below did not even start until they had all finished. That is the "lyrics take
+     * a while to turn up" this fixed.
      */
-    private static String[] dirsFor(MediaController c) {
+    private static String dirFor(MediaController c) {
         String pkg = c == null ? "" : c.getPackageName();
         if (pkg.contains("apple")) {
-            return new String[]{"am-lyrics", "ncm-lyrics", "qq-lyrics"};
+            return "am-lyrics";
         }
         if (pkg.contains("spotify")) {
-            return new String[]{"spotify-lyrics", "ncm-lyrics", "am-lyrics"};
+            return "spotify-lyrics";
         }
-        return new String[]{"ncm-lyrics", "am-lyrics", "qq-lyrics"};
+        if (pkg.contains("qqmusic")) {
+            return "qq-lyrics";
+        }
+        // MeiLoX is a NetEase client under its own name and publishes NetEase ids - measured,
+        // not assumed: MEDIA_ID 2717588324 with cover art from p2.music.126.net.
+        if (pkg.contains("netease") || pkg.contains("cloudmusic") || pkg.contains("meilox")) {
+            return "ncm-lyrics";
+        }
+        // Everyone else: no directory, so the database is not asked at all.
+        //
+        // The database has four directories and they are four platforms' id spaces. A player
+        // outside them - Kugou, Qishui, Salt, Mi Music - publishes ids that mean nothing in any
+        // of them, so a lookup is a wasted request at best and a wrong song at worst: the ids
+        // are plain integers in overlapping ranges, and a collision returns a real, well-formed,
+        // unrelated lyric with nothing about it to look wrong. Falling back to ncm-lyrics for
+        // unknown packages did exactly that. These players go to the by-name route, which is
+        // where they were always going to end up.
+        return null;
     }
 
     /**
@@ -240,58 +295,246 @@ final class LyricSource {
     static void load(final MediaController c, final Callback cb) {
         final String pkg = c == null ? "?" : c.getPackageName();
 
-        // The player's own lyrics first. Everything the id route below cannot do - a player that
-        // publishes no id, a song no online database has, a mirror that is down - is something
-        // this route does not need: the lyrics came in with the session, and for a local-file
-        // player they are the file's own.
         final String info = lyricInfoOf(c);
-        final String text = textOfLyricInfo(info);
-        final String raw = rawOfLyricInfo(info);
-        if (text != null || raw != null) {
+        final String dir = dirFor(c);
+        // An id is only worth having when there is a directory it belongs to; without one it
+        // cannot be looked up anywhere, and pretending otherwise is how a lookup lands in the
+        // wrong platform's id space.
+        final String id = dir == null ? null : idOf(c);
+        final NcmLyrics.Query q = NcmLyrics.queryOf(c);
+        if (info == null && id == null && q == null) {
+            Xp.log("[MCLyric] " + pkg + " publishes neither lyricInfo, a song id, nor a name");
+            onMain(cb, java.util.Collections.<LyricLine>emptyList(),
+                    "nothing to read from " + pkg, SRC_NONE);
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                Rows r = new Rows();
+                // Three sources, best first, each one asked only because the one before it came
+                // up empty. Every step falls through rather than stopping, which is the whole
+                // shape of this: a source that is present but useless - a provider module that
+                // wrote a lyricInfo it could not fill, an id the database does not have - used
+                // to end the search, and the song played on with nothing on screen while a
+                // perfectly good answer sat one step further down.
+                if (info != null) {
+                    session(info, r);
+                }
+                if (r.lines.isEmpty() && (id != null || q != null)) {
+                    race(id, dir, q, r);
+                }
+                Xp.log("[MCLyric] " + pkg + " -> " + r.why);
+                onMain(cb, r.lines, r.why, r.source);
+            }
+        }, "MCLyricSource").start();
+    }
+
+    /** Lines and the one-line account of where they came from, filled in by one source. */
+    private static final class Rows {
+        List<LyricLine> lines = java.util.Collections.emptyList();
+        String why = "nothing to read";
+        int source = SRC_NONE;
+    }
+
+    /** The whole lookup, including the mirrors and a miss. Nothing is waited for past this. */
+    private static final long RACE_BUDGET_MS = 8000L;
+
+    /**
+     * How long NetEase's answer waits for the database's, once it has one of its own.
+     *
+     * The database is the better of the two when it has the song - its files are hand-checked and
+     * carry things NetEase's do not, like which voice sings which line - so it is worth a short
+     * pause to let it win. Short, because it usually does not have the song: measured here a hit
+     * from jsdelivr lands in ~450ms against NetEase's ~320ms, so a few hundred milliseconds is
+     * enough to prefer it when it is there, and nothing like long enough to wait out a miss.
+     */
+    private static final long DATABASE_GRACE_MS = 400L;
+
+    /**
+     * Both routes at once, the better one preferred but not waited out.
+     *
+     * These used to run in order, and that is what made the lyrics late: a player that publishes
+     * an id - Apple Music does - spent the database's full miss before the fallback was even
+     * started, and the fallback is the one that actually had the song. Run together, a miss on
+     * one costs nothing on the other.
+     */
+    private static void race(final String id, final String dir, final NcmLyrics.Query q,
+                             Rows out) {
+        final Rows db = new Rows();
+        final Rows ncm = new Rows();
+        // Tags rather than the rows themselves: a row says nothing about which route produced it
+        // once that route has come up empty, and "which one just finished" is the whole question.
+        final BlockingQueue<Integer> done = new LinkedBlockingQueue<>();
+        int pending = 0;
+        if (id != null) {
+            pending++;
             new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    List<LyricLine> lines;
-                    String why;
                     try {
-                        // The word-timed copy when there is one: "lyric" is the display form and
-                        // is often line-timed even when "rawLyric" has every word's timing, and
-                        // preferring it left a word-timed song with no word fill at all.
-                        lines = java.util.Collections.emptyList();
-                        String used = "lyric";
-                        if (raw != null) {
-                            List<LyricLine> r = LyricParse.parse(raw);
-                            for (LyricLine l : r) {
-                                if (l.hasWords()) {
-                                    lines = r;
-                                    used = "rawLyric";
-                                    break;
-                                }
-                            }
-                        }
-                        if (lines.isEmpty() && text != null) lines = LyricParse.parse(text);
-                        why = lines.isEmpty() ? "lyricInfo parsed to nothing"
-                                : lines.size() + " lines from the player's own lyricInfo (" + used + ")";
-                    } catch (Throwable t) {
-                        Xp.log("[MCLyric] lyricInfo parse failed: " + t);
-                        lines = java.util.Collections.emptyList();
-                        why = "lyricInfo parse error";
+                        database(id, dir, db);
+                    } finally {
+                        done.offer(1);
                     }
-                    Xp.log("[MCLyric] " + pkg + " -> " + why);
-                    onMain(cb, lines, why);
                 }
-            }, "MCLyricParse").start();
+            }, "MCLyricDb").start();
+        }
+        if (q != null) {
+            pending++;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        netease(q, ncm);
+                    } finally {
+                        done.offer(2);
+                    }
+                }
+            }, "MCLyricNcm").start();
+        }
+        boolean haveNcm = false;
+        long deadline = android.os.SystemClock.uptimeMillis() + RACE_BUDGET_MS;
+        while (pending > 0) {
+            long left = deadline - android.os.SystemClock.uptimeMillis();
+            if (left <= 0) {
+                break;
+            }
+            Integer tag;
+            try {
+                tag = done.poll(left, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (tag == null) {
+                break;
+            }
+            pending--;
+            if (tag == 1 && !db.lines.isEmpty()) {
+                out.lines = db.lines;
+                out.why = join(out.why, db.why);
+                out.source = db.source;
+                return;
+            }
+            if (tag == 2 && !ncm.lines.isEmpty()) {
+                haveNcm = true;
+                // Hold the answer briefly in case the database is about to beat it on quality.
+                long grace = android.os.SystemClock.uptimeMillis() + DATABASE_GRACE_MS;
+                if (grace < deadline) {
+                    deadline = grace;
+                }
+            }
+        }
+        if (haveNcm) {
+            out.lines = ncm.lines;
+            out.why = join(out.why, ncm.why);
+            out.source = ncm.source;
             return;
         }
+        // Neither had it. Both accounts are worth keeping - which one failed and how is the
+        // first thing asked of a song that showed no lyrics.
+        String both = join(db.why == null || id == null ? null : db.why,
+                q == null ? null : ncm.why);
+        out.why = join(out.why, both == null ? "nothing found" : both);
+    }
 
-        final String id = idOf(c);
-        if (id == null) {
-            Xp.log("[MCLyric] " + pkg + " publishes neither lyricInfo nor a song id");
-            onMain(cb, java.util.Collections.<LyricLine>emptyList(),
-                    "nothing to read from " + pkg);
-            return;
+    /**
+     * The lyric the session is already carrying - the player's own, or a provider module's.
+     *
+     * The best of the three when it is there: no network, no matching, and for a local-file
+     * player it is the file's own lyric, which is the only thing that can be right for music no
+     * online catalogue has.
+     */
+    private static void session(String info, Rows r) {
+        try {
+            String text = textOfLyricInfo(info);
+            String raw = rawOfLyricInfo(info);
+            if (text == null && raw == null) {
+                // The field is there and empty, which is what a provider module publishes while
+                // it is still fetching - MeiLoX writes {"lyric":"","noLyric":true}.
+                r.why = "the session's lyricInfo is empty";
+                return;
+            }
+            // The word-timed copy when there is one: "lyric" is the display form and is often
+            // line-timed even when "rawLyric" has every word's timing, and preferring it left a
+            // word-timed song with no word fill at all.
+            String used = "lyric";
+            if (raw != null) {
+                List<LyricLine> w = LyricParse.parse(raw);
+                for (LyricLine l : w) {
+                    if (l.hasWords()) {
+                        r.lines = w;
+                        used = "rawLyric";
+                        break;
+                    }
+                }
+            }
+            if (r.lines.isEmpty() && text != null) {
+                r.lines = LyricParse.parse(text);
+            }
+            if (r.lines.isEmpty()) {
+                r.why = "lyricInfo parsed to nothing";
+                return;
+            }
+            r.source = SRC_LYRIC_INFO;
+            r.why = r.lines.size() + " lines from the session's own lyricInfo (" + used + ")";
+        } catch (Throwable t) {
+            Xp.log("[MCLyric] lyricInfo parse failed: " + t);
+            r.lines = java.util.Collections.emptyList();
+            r.why = "lyricInfo parse error";
         }
-        load(id, dirsFor(c), pkg, cb);
+    }
+
+    /** The AMLL database, by platform id, in the one directory that id can belong to. */
+    private static void database(String id, String dir, Rows r) {
+        String before = r.why;
+        try {
+            Answer a = fetch(dir, id);
+            if (a.status != FOUND) {
+                r.why = join(before, a.status == MISSING
+                        ? "not in " + dir + " (" + id + ")"
+                        : "could not reach the database");
+                return;
+            }
+            r.lines = LyricParse.parse(a.body);
+            r.why = r.lines.isEmpty()
+                    ? join(before, "parsed to nothing (" + dir + ")")
+                    : r.lines.size() + " lines from " + dir;
+            if (!r.lines.isEmpty()) r.source = SRC_DATABASE;
+        } catch (Throwable t) {
+            Xp.log("[MCLyric] database lookup failed: " + t);
+            r.why = join(before, "database error");
+        }
+    }
+
+    /** By name, from NetEase - the only source that covers a player publishing no id at all. */
+    private static void netease(NcmLyrics.Query q, Rows r) {
+        String before = r.why;
+        try {
+            NcmLyrics.Found f = NcmLyrics.load(q);
+            if (f == null) {
+                r.why = join(before, "no match on NetEase");
+                return;
+            }
+            r.lines = LyricParse.parse(f.body, f.translation);
+            r.why = r.lines.isEmpty()
+                    ? join(before, "NetEase " + f.id + " parsed to nothing")
+                    : r.lines.size() + " lines from NetEase " + f.id
+                    + " (" + (f.words ? "yrc" : "lrc") + ")";
+            if (!r.lines.isEmpty()) r.source = SRC_NETEASE;
+        } catch (Throwable t) {
+            Xp.log("[MCLyric] NetEase lookup failed: " + t);
+            r.why = join(before, "NetEase error");
+        }
+    }
+
+    /** Both halves of why it failed, when more than one source was asked and all came up empty. */
+    private static String join(String before, String now) {
+        if (before == null || "nothing to read".equals(before)) {
+            return now;
+        }
+        return now == null ? before : before + "; " + now;
     }
 
     /**
@@ -300,59 +543,28 @@ final class LyricSource {
      * playing app publishing anything.
      */
     static void loadById(final String id, final boolean apple, final Callback cb) {
-        load(id, apple
-                ? new String[]{"am-lyrics", "ncm-lyrics"}
-                : new String[]{"ncm-lyrics", "am-lyrics"}, "id " + id, cb);
+        load(id, apple ? "am-lyrics" : "ncm-lyrics", "id " + id, cb);
     }
 
-    private static void load(final String id, final String[] dirs, final String who,
+    private static void load(final String id, final String dir, final String who,
                              final Callback cb) {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                List<LyricLine> lines = java.util.Collections.emptyList();
-                String why;
-                try {
-                    Answer a = null;
-                    String foundIn = null;
-                    for (String dir : dirs) {
-                        a = fetch(dir, id);
-                        if (a.status == FOUND) {
-                            foundIn = dir;
-                            break;
-                        }
-                        // A 404 means this directory is not the one this id belongs to, so the
-                        // next is worth asking. An unreachable mirror means the network, and
-                        // asking a second directory would only spend another timeout to learn
-                        // nothing.
-                        if (a.status == UNREACHABLE) {
-                            break;
-                        }
-                    }
-                    if (a == null || a.status != FOUND) {
-                        why = "not in the database (" + id + ")";
-                    } else {
-                        lines = LyricParse.parse(a.body);
-                        why = lines.isEmpty()
-                                ? "parsed to nothing (" + foundIn + ")"
-                                : lines.size() + " lines from " + foundIn;
-                    }
-                } catch (Throwable t) {
-                    Xp.log("[MCLyric] load failed: " + t);
-                    why = "error";
-                }
-                Xp.log("[MCLyric] " + who + " id=" + id + " -> " + why);
-                onMain(cb, lines, why);
+                Rows r = new Rows();
+                database(id, dir, r);
+                Xp.log("[MCLyric] " + who + " id=" + id + " -> " + r.why);
+                onMain(cb, r.lines, r.why, r.source);
             }
         }, "MCLyricSource").start();
     }
 
     private static void onMain(final Callback cb, final List<LyricLine> lines,
-                               final String why) {
+                               final String why, final int source) {
         Main.main().post(new Runnable() {
             @Override
             public void run() {
-                cb.onLines(lines, why);
+                cb.onLines(lines, why, source);
             }
         });
     }
@@ -440,6 +652,96 @@ final class LyricSource {
                 }
             }
         }
+    }
+
+    /**
+     * Every key the session is publishing, with enough of each value to recognise it.
+     *
+     * Which players this feature covers is decided entirely by what they put on the session, and
+     * that cannot be reasoned about - only read. Players differ in whether they publish lyrics at
+     * all, under `lyricInfo` or a key of their own, whether MEDIA_ID is the platform's id or an
+     * internal uri, and whether the title is the song or (for one local player) the current lyric
+     * line. So this lists the keys rather than looking for the ones already known: a key nobody
+     * here has heard of is exactly what widening the coverage needs to find.
+     *
+     * Values are cut short and bitmaps are reduced to their size, because a lyric payload is tens
+     * of kilobytes and the point is to see WHICH keys carry something, not to read the words.
+     */
+    // Bundle.get is deprecated in favour of the typed getters, which is exactly what this cannot
+    // use: the point is to print a key whose type nobody here knows yet.
+    @SuppressWarnings("deprecation")
+    static String dumpMetadata(MediaController c) {
+        if (c == null) return "no session being watched";
+        MediaMetadata md;
+        try {
+            md = c.getMetadata();
+        } catch (Throwable t) {
+            return c.getPackageName() + ": getMetadata threw " + t;
+        }
+        if (md == null) return c.getPackageName() + ": no metadata";
+        StringBuilder sb = new StringBuilder(c.getPackageName());
+        sb.append('\n');
+        java.util.Set<String> keys;
+        try {
+            keys = md.keySet();
+        } catch (Throwable t) {
+            return sb.append("keySet threw ").append(t).toString();
+        }
+        java.util.List<String> sorted = new java.util.ArrayList<>(keys);
+        java.util.Collections.sort(sorted);
+        for (String k : sorted) {
+            sb.append("  ").append(k).append(" = ").append(valueOf(md, k)).append('\n');
+        }
+        // The session's extras, which are a second place entirely - a Bundle the player sets on
+        // the session rather than on the metadata. Nothing found here yet, but "we never looked"
+        // and "there is nothing there" are different answers and this is the one worth having:
+        // a player that puts its lyrics here would otherwise look identical to one publishing
+        // nothing at all.
+        try {
+            android.os.Bundle ex = c.getExtras();
+            if (ex == null || ex.isEmpty()) {
+                sb.append("  (session extras: none)\n");
+            } else {
+                for (String k : ex.keySet()) {
+                    Object v = ex.get(k);
+                    String s = v == null ? "null" : v.toString();
+                    sb.append("  extras.").append(k).append(" = ")
+                            .append(s.length() > 160 ? s.substring(0, 160) + "..." : s)
+                            .append('\n');
+                }
+            }
+        } catch (Throwable t) {
+            sb.append("  (session extras threw ").append(t).append(")\n");
+        }
+        sb.append("  -> id=").append(idOf(c))
+                .append(" lyricInfo=").append(lyricInfoOf(c) == null ? "no" : "yes")
+                .append("\n  -> by name: ").append(NcmLyrics.queryOf(c));
+        return sb.toString();
+    }
+
+    /** One metadata value, short enough to read and typed enough to act on. */
+    private static String valueOf(MediaMetadata md, String k) {
+        try {
+            android.graphics.Bitmap b = md.getBitmap(k);
+            if (b != null) return "Bitmap[" + b.getWidth() + "x" + b.getHeight() + "]";
+        } catch (Throwable ignored) {
+        }
+        try {
+            CharSequence cs = md.getText(k);
+            if (cs != null) {
+                String s = cs.toString();
+                String cut = s.length() > 160 ? s.substring(0, 160) + "..." : s;
+                // Newlines would break the one-key-per-line shape a reader relies on.
+                return "(" + s.length() + " chars) " + cut.replace("\n", "\\n");
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            long l = md.getLong(k);
+            if (l != 0L) return String.valueOf(l);
+        } catch (Throwable ignored) {
+        }
+        return "(empty or of another type)";
     }
 
     private static String read(InputStream in) throws Exception {

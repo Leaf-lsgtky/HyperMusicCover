@@ -39,8 +39,21 @@ internal fun ShadePageView(
 ) {
     val context = LocalContext.current
     var module by remember { mutableStateOf(ModuleBridge.State()) }
-    LaunchedEffect(refreshKey) { module = ModuleBridge.query(context) }
-    val master = (module.shade["enabled"] ?: 1) != 0
+    // Whether the module has had its chance to answer. Until it has, the page says nothing about
+    // it: "not loaded" is as wrong a thing to show a phone that is still starting SystemUI as
+    // "on" is to show one where the feature is off.
+    var asked by remember { mutableStateOf(false) }
+    LaunchedEffect(refreshKey) {
+        module = ModuleBridge.queryAlive(context)
+        asked = true
+    }
+    // Only an answer can put this switch on. The key is missing in two cases - nothing answered,
+    // and a module older than the setting - and reading the module's ship default for BOTH is
+    // what made a timed-out query report the feature as on. This is the app's only switch whose
+    // default is on, which is why it was the only one that ever "turned itself back on": the
+    // query after a scope restart lands before SystemUI has a receiver, and the page then showed
+    // 流光 enabled and greyed out, with no way to turn off something that was already off.
+    val master = module.alive && (module.shade["enabled"] ?: 1) != 0
     // Everything below the master switch greys out with it; the switch itself only needs the module.
     val enabled = module.alive && master
 
@@ -63,6 +76,14 @@ internal fun ShadePageView(
                 ) {
                     SwitchPreference(
                         title = stringResource(R.string.shade_enabled),
+                        // Said here rather than left to a greyed-out page: a switch that cannot
+                        // be moved and does not say why is the whole of what the user sees when
+                        // the module is not loaded, and it reads as the switch being broken.
+                        summary = if (asked && !module.alive) {
+                            stringResource(R.string.home_status_inactive_hint)
+                        } else {
+                            null
+                        },
                         checked = master,
                         enabled = module.alive,
                         onCheckedChange = { push("enabled", if (it) 1 else 0) },

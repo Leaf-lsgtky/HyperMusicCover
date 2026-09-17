@@ -15,6 +15,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <queries>
+        <!-- Whether a lyric provider module is installed, for the notice on the lyrics page.
+             Declared because package visibility is filtered from Android 11 on: without this the
+             lookup throws NameNotFound even when the package is there. -->
+        <package android:name="com.lidesheng.lyricinfo" />
+        <package android:name="com.lidesheng.lyricinfo.lite" />
         <package android:name="com.tencent.mobileqq" />
         <package android:name="com.tencent.tim" />
         <package android:name="com.tencent.mobileqqi" />
@@ -72,7 +77,7 @@
         </activity-alias>
 
         <!-- The other way back in while the icon is hidden: dial *#*#95993926#*#*. Both actions,
-             as InstallerX registers them; the dialler decides which one it sends. -->
+             as InstallerX Revived registers them; the dialler decides which one it sends. -->
         <receiver
             android:name=".SecretCodeReceiver"
             android:exported="true">
@@ -96,6 +101,13 @@
             android:label="@string/third_party_licenses_title"
             android:theme="@style/Theme.HyperMusicCover" />
 
+        <!-- The credits, opened from the About page's row under the licence list. -->
+        <activity
+            android:name=".CreditsActivity"
+            android:exported="false"
+            android:label="@string/about_credits"
+            android:theme="@style/Theme.HyperMusicCover" />
+
         <!-- The features tab's two sub-screens, declared exactly like the licence list above:
              an Activity each, so the platform supplies the transition and the back handling
              rather than the features page imitating both. -->
@@ -109,6 +121,13 @@
             android:name=".ShadeActivity"
             android:exported="false"
             android:label="@string/features_shade_title"
+            android:theme="@style/Theme.HyperMusicCover" />
+
+        <!-- The payment codes, opened from the home page's donate card. -->
+        <activity
+            android:name=".DonateActivity"
+            android:exported="false"
+            android:label="@string/donate_title"
             android:theme="@style/Theme.HyperMusicCover" />
 
         <!--

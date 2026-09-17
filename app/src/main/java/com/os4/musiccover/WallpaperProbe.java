@@ -76,7 +76,23 @@ public class WallpaperProbe {
      */
     private static volatile boolean sTexFit = true;
     private static volatile Object sKeyguardTexture;
-    private static Bitmap sScreenArt;
+    /**
+     * The size each keyguard texture was last uploaded at, so getTextureDimensions can answer for
+     * the texture being asked about instead of for whichever screen uploaded most recently.
+     * Weak, because these are the OEM's objects and a screen that goes away takes its own with it.
+     */
+    private static final java.util.Map<Object, android.graphics.Rect> sTexSizes =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, android.graphics.Rect>());
+    /**
+     * Fitted copies of one source, keyed by the surface they were cut for.
+     *
+     * A map rather than a single bitmap because a foldable asks for more than one size and keeps
+     * asking: the inner and outer screens each upload with their own renderer, so a single slot
+     * was re-cut on every hand-over. Cleared whole when the source changes, which is the only
+     * time these stop being wanted.
+     */
+    private static final java.util.HashMap<Long, Bitmap> sScreenArts = new java.util.HashMap<>();
     private static Bitmap sScreenArtOf;
     private static volatile int sReportedW, sReportedH;
 
@@ -94,7 +110,31 @@ public class WallpaperProbe {
      * the lyrics fades frosted to frosted with nothing else knowing. Cleared when the cover goes.
      */
     private static volatile boolean sLyricBlur;
+    /**
+     * The newest thing SystemUI has asked for, which is not the same as what is on screen: a
+     * switch waits for a fade in the air before it takes effect. Recorded the moment the message
+     * arrives, so a waiting one that has since been overtaken can drop out instead of writing a
+     * stale answer back - which is how a track changed at the moment the lyrics arrived could
+     * leave the cover sharp for the rest of the song, both sides believing it was blurred.
+     */
+    private static volatile boolean sLyricBlurWant;
     private static Bitmap sFrosted, sFrostedOf;
+    private static Bitmap sFrosted2, sFrostedOf2;
+
+    /**
+     * One track change, segment by segment, read back with `op timing`.
+     *
+     * Both processes read the same uptimeMillis clock and SystemUI sends its own marks along with
+     * the cover, so the whole path - the card naming a new track, the artwork being waited for,
+     * the broadcast, the composition, the upload - subtracts into one timeline here. Everything
+     * is a bare field write on a path that already exists; nothing is measured that was not
+     * already happening.
+     */
+    private static volatile long sTmT0, sTmBurst, sTmArt, sTmSent, sTmRecv, sTmRead, sTmComposed,
+            sTmFrosted, sTmMain, sTmUploaded, sTmCheckMs;
+    private static volatile long sTmSkip;
+    private static volatile int sTmTries, sTmSkips, sTmSkipDir;
+    private static volatile String sTmKind = "";
 
     /**
      * The keyguard engine, captured so a new track can re-run the texture upload without the
@@ -102,6 +142,17 @@ public class WallpaperProbe {
      * GL directly, it only asks the engine to run its own surface-created path again.
      */
     private static volatile Object sKeyguardEngine;
+
+    /**
+     * Every keyguard engine built, newest last.
+     *
+     * A foldable builds one engine per screen, and sKeyguardEngine above holds whichever was
+     * constructed last - so on those the cover can be pushed at a screen the user is not looking
+     * at, with nothing in the log to say so. Kept as a list first and picked between second,
+     * because which one is right is exactly the question the port has to answer.
+     */
+    private static final java.util.List<Object> sKeyguardEngines =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
     /** Renderer class names already reported by the diagnostic above; one line each. */
     private static final java.util.Set<String> sUploadNames =
@@ -333,6 +384,17 @@ public class WallpaperProbe {
      *   --es op fadems --ei v 370
      */
     private static volatile long sFadeMs = 370L;
+    /**
+     * The crossfade for a TRACK CHANGE, which is a different animation with a different job.
+     *
+     * sFadeMs above is solved against the clock's spring, because entering and leaving cover mode
+     * move the wallpaper and the clock together and they have to arrive together. A track change
+     * moves neither the clock nor anything else: it swaps one cover for the next, with nothing on
+     * screen to keep company with. Tying it to the clock's number only made it slow.
+     *
+     *   --es op trackfadems --ei v 60
+     */
+    private static volatile long sTrackFadeMs = 180L;
     private static final long FADE_STEP_MS = 16L;
     /**
      * Whether the OEM's frosted copy is regenerated on the fade's frames.
@@ -503,14 +565,32 @@ public class WallpaperProbe {
                 if (keyguard && args.length > 0 && args[0] instanceof Bitmap) {
                     Bitmap orig = (Bitmap) args[0];
                     sKeyguardRenderer = chain.getThisObject();
-                    if (sKeyguardTexture == null) {
-                        // Kept so the dimension hook can tell the keyguard's texture from the
-                        // desktop one's: same class, two instances, and only one of them is ours.
-                        try {
-                            sKeyguardTexture = Xp.getObjectField(chain.getThisObject(), "mTexture");
-                        } catch (Throwable ignored) {
-                        }
+                    // Kept so the dimension hook can tell the keyguard's texture from the
+                    // desktop one's: same class, two instances, and only one of them is ours.
+                    //
+                    // Re-read on every upload rather than only the first. A foldable has a
+                    // renderer per screen - five of them on the q18 build - each with its own
+                    // texture, and holding the first one seen meant the dimension hook stopped
+                    // recognising the texture as soon as another screen drew. This branch is
+                    // already inside `if (keyguard)`, so whatever it finds here is a keyguard
+                    // texture; the only question is which screen's, and the answer is always
+                    // the one uploading right now.
+                    try {
+                        Object t = Xp.getObjectField(chain.getThisObject(), "mTexture");
+                        if (t != null) sKeyguardTexture = t;
+                    } catch (Throwable ignored) {
                     }
+                    // BEFORE the fit below, not after. screenSized() crops to sSurfaceW/H, and
+                    // those used to be written further down by noteRenderState - i.e. they held
+                    // whichever renderer uploaded LAST. On one screen that is the same size and
+                    // nothing shows; on a foldable it is routinely a different screen, so the
+                    // picture was cropped for one screen and handed to another. The measured
+                    // shape of that is a viewport and an upload that disagree:
+                    // `viewport=Rect(0,0-2364,1672) mvpFrom=Rect(0,0-1168,1712) upload=1168x1712`
+                    // - the cover cropped for the outer screen, uploaded to the inner one.
+                    // Reading it off THIS renderer makes the crop, the MVP source and the
+                    // viewport the same screen's by construction.
+                    adoptSurfaceOf(chain.getThisObject());
                     // The experiment's other half. Everything below - the fade size check, the
                     // art fit, sReportedW/H that fittedArt() scales by - then sees the screen's
                     // size rather than the wallpaper file's, which is the whole point.
@@ -524,6 +604,12 @@ public class WallpaperProbe {
                         sReportedW = w;
                         sReportedH = h;
                         Xp.log(TAG + "keyguard texture is " + w + "x" + h);
+                    }
+                    // Remembered against the texture itself, because the MVP matrix is built
+                    // later, off whatever getTextureDimensions answers then - by which time
+                    // another screen may have uploaded.
+                    if (sKeyguardTexture != null) {
+                        sTexSizes.put(sKeyguardTexture, new android.graphics.Rect(0, 0, w, h));
                     }
                     noteRenderState(chain.getThisObject(), w, h);
                     // A GPU fade's far end. Uploaded once, and from then on the fade is drawn
@@ -615,6 +701,10 @@ public class WallpaperProbe {
                         }
                         fitted = frostedIfWanted(fitted);
                         args[0] = fitted;
+                        // The first upload after a push is the one the user sees. Later ones (a
+                        // fade's frames) leave the mark where it was, so `op timing` reports the
+                        // moment the new cover reached the screen, not the end of its animation.
+                        if (sTmUploaded == 0L) sTmUploaded = SystemClock.uptimeMillis();
                         Xp.log(TAG + "wallpaper texture REPLACED " + describe(orig)
                                 + " -> " + describe(fitted)
                                 + (fitted == art ? " (no rescale)" : ""));
@@ -640,7 +730,16 @@ public class WallpaperProbe {
                     "com.miui.miwallpaper.opengl.ImageWallpaperRenderer$WallpaperTexture", sCl);
             Xp.hookAll(tex, "getTextureDimensions", chain -> {
                 Object self = chain.getThisObject();
-                if (!sTexFit || self == null || self != sKeyguardTexture) return chain.proceed();
+                if (!sTexFit || self == null) return chain.proceed();
+                // What THIS texture was last given, not what the last upload anywhere was. On a
+                // foldable the two are routinely different screens, and answering with the other
+                // one's size builds the MVP matrix from a rectangle the uploaded bitmap does not
+                // have - the picture then lands scaled and offset, which is exactly the symptom
+                // that only a fold or a rotation could clear. The map holds keyguard textures
+                // only, so the desktop's still gets the OEM's own answer.
+                android.graphics.Rect r = sTexSizes.get(self);
+                if (r != null) return r;
+                if (self != sKeyguardTexture) return chain.proceed();
                 int w = sSurfaceW, h = sSurfaceH;
                 if (w <= 0 || h <= 0) return chain.proceed();
                 return new android.graphics.Rect(0, 0, w, h);
@@ -695,6 +794,11 @@ public class WallpaperProbe {
             Xp.hookAllConstructors(eng, chain -> {
                 Object result = chain.proceed();
                 sKeyguardEngine = chain.getThisObject();
+                // Read the obfuscated member names off this instance before anything reaches for
+                // them. A foldable builds one engine per screen, so this also runs more than once
+                // there - resolve() is per engine class and returns at once after the first.
+                EngineNames.resolve(sKeyguardEngine);
+                noteEngineInstance(sKeyguardEngine);
                 Xp.log(TAG + "keyguard engine captured: " + sKeyguardEngine);
                 // From here the lock screen has an image engine, so this is the first moment a
                 // cover has somewhere to go - and by now the receiver above is up, which is what
@@ -1098,6 +1202,8 @@ public class WallpaperProbe {
     }
 
     private static String sRenderState = "";
+    /** How the last GPU fade ended, for `op selftest`. */
+    private static volatile String sLastFade = "none yet";
     private static boolean sRenderStateFailed;
     /** The screen, as MIUI's own renderer has it (mSurfaceSize). 0 until an upload has run. */
     private static volatile int sSurfaceW, sSurfaceH;
@@ -1116,16 +1222,16 @@ public class WallpaperProbe {
      * the triple CHANGES, so a steady state costs one string compare per upload and says
      * nothing, and the frame that moves the picture is the one that prints.
      */
-    private static void noteRenderState(Object renderer, int w, int h) {
-        if (sRenderStateFailed) return;
+    /**
+     * Takes this renderer's surface as the screen to fit to.
+     *
+     * The one place the SCREEN's own size is knowable in this process, and on a foldable it is a
+     * different answer per renderer - so it is read from the renderer that is about to upload,
+     * immediately before the crop that uses it, rather than left over from the last one.
+     */
+    private static void adoptSurfaceOf(Object renderer) {
         try {
             Object surface = Xp.getObjectField(renderer, "mSurfaceSize");
-            Object texture = Xp.getObjectField(renderer, "mTexture");
-            Object dims = texture == null ? null
-                    : Xp.callMethod(texture, "getTextureDimensions");
-            // Read before the early return below: this is the only place the SCREEN's own size
-            // is knowable in this process, and startFade() needs it on every fade, not only on
-            // the frames where something changed.
             if (surface instanceof android.graphics.Rect) {
                 android.graphics.Rect r = (android.graphics.Rect) surface;
                 if (r.width() > 0 && r.height() > 0) {
@@ -1133,6 +1239,17 @@ public class WallpaperProbe {
                     sSurfaceH = r.height();
                 }
             }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void noteRenderState(Object renderer, int w, int h) {
+        if (sRenderStateFailed) return;
+        try {
+            Object surface = Xp.getObjectField(renderer, "mSurfaceSize");
+            Object texture = Xp.getObjectField(renderer, "mTexture");
+            Object dims = texture == null ? null
+                    : Xp.callMethod(texture, "getTextureDimensions");
             String now = "viewport=" + surface + " mvpFrom=" + dims
                     + " upload=" + w + "x" + h;
             if (now.equals(sRenderState)) return;
@@ -1156,17 +1273,53 @@ public class WallpaperProbe {
         return sharp == null || !sLyricBlur ? sharp : frostedOf(sharp);
     }
 
-    /** The frosted copy of one fitted picture, made once. Called off the GL thread first. */
+    /**
+     * The frosted copy of one fitted picture, made once. Called off the GL thread first.
+     *
+     * Two are kept, because a track change needs both ends of its crossfade at the same time -
+     * the song going out and the one coming in. With one slot, the incoming picture evicted the
+     * outgoing one and the fade paid for it a second time, which is the cost this is here to
+     * avoid in the first place.
+     */
     private static synchronized Bitmap frostedOf(Bitmap sharp) {
-        Bitmap f = sFrosted;
-        if (f != null && sFrostedOf == sharp && !f.isRecycled()) return f;
+        if (sFrosted != null && sFrostedOf == sharp && !sFrosted.isRecycled()) return sFrosted;
+        if (sFrosted2 != null && sFrostedOf2 == sharp && !sFrosted2.isRecycled()) {
+            // Answered from the older slot: make it the newer one, so the next picture evicts
+            // whichever of the two has gone longest without being asked for.
+            Bitmap f = sFrosted2, of = sFrostedOf2;
+            sFrosted2 = sFrosted;
+            sFrostedOf2 = sFrostedOf;
+            sFrosted = f;
+            sFrostedOf = of;
+            return f;
+        }
         long t0 = SystemClock.uptimeMillis();
-        f = CoverCompose.frosted(sharp);
-        sFrosted = f;
-        sFrostedOf = sharp;
+        Bitmap f = CoverCompose.frosted(sharp);
+        cacheFrosted(sharp, f);
         Xp.log(TAG + "frosted " + describe(sharp) + " in " + (SystemClock.uptimeMillis() - t0)
                 + "ms");
         return f;
+    }
+
+    /** Puts a frosted copy in the newer slot, keyed on the sharp picture it stands in for. */
+    private static synchronized void cacheFrosted(Bitmap sharp, Bitmap frosted) {
+        if (frosted == null) return;
+        sFrosted2 = sFrosted;
+        sFrostedOf2 = sFrostedOf;
+        sFrosted = frosted;
+        sFrostedOf = sharp;
+    }
+
+    /**
+     * Lets go of both frosted copies. Not recycled: a fade in the air holds its own reference to
+     * whichever one it is drawing from, and dropping ours only means the next one is made again.
+     * Called when the cover goes, where two screen-sized bitmaps are pure cost.
+     */
+    private static synchronized void dropFrosted() {
+        sFrosted = null;
+        sFrostedOf = null;
+        sFrosted2 = null;
+        sFrostedOf2 = null;
     }
 
     private static Bitmap sharpFittedArt() {
@@ -1250,6 +1403,11 @@ public class WallpaperProbe {
      * transition. The clock is springing to its own curve over in SystemUI and cannot wait.
      */
     private static void startFade(final Bitmap from, final Bitmap to, final Runnable done) {
+        startFade(from, to, done, sFadeMs);
+    }
+
+    private static void startFade(final Bitmap from, final Bitmap to, final Runnable done,
+                                  final long durMs) {
         final Context ctx = sCtx;
         if (ctx == null || from == null || to == null || from.isRecycled() || to.isRecycled()
                 || from.getWidth() != to.getWidth() || from.getHeight() != to.getHeight()) {
@@ -1259,7 +1417,7 @@ public class WallpaperProbe {
             return;
         }
         if (gpuFadeUsable()) {
-            startGpuFade(from, to, done);
+            startGpuFade(from, to, done, durMs);
             return;
         }
         if (fadeTooExpensive(from)) {
@@ -1298,7 +1456,7 @@ public class WallpaperProbe {
                     return;
                 }
                 long el = now - t0;
-                if (el >= sFadeMs) {
+                if (el >= durMs) {
                     sFade = null;
                     sFadeInFlight = false;
                     sFrostSkipping = false;
@@ -1312,7 +1470,7 @@ public class WallpaperProbe {
                             + (sSkipFrost ? ", frosting skipped" : ""));
                     return;
                 }
-                float t = el / (float) sFadeMs;
+                float t = el / (float) durMs;
                 // Ease OUT, not smoothstep. The clock it has to keep company with is a spring,
                 // and a spring is all front-loaded: most of the movement is over in the first
                 // third. A symmetric curve spends that third barely changing, which is exactly
@@ -1407,7 +1565,7 @@ public class WallpaperProbe {
         return false;
     }
 
-    private static void startGpuFade(Bitmap from, Bitmap to, Runnable done) {
+    private static void startGpuFade(Bitmap from, Bitmap to, Runnable done, long durMs) {
         // A CPU fade still running owns sFade; stop it before the texture changes hands. A GPU
         // fade overtaken by this one simply stops too, without running its completion - the
         // same rule the CPU fade's generation check follows, and for the same reason: the one
@@ -1427,7 +1585,7 @@ public class WallpaperProbe {
                 // Both pictures are already on the GPU, so this runs the same pair backwards
                 // from the alpha on screen right now, and uploads nothing to do it.
                 float target = old.a1 >= 0.5f ? 0f : 1f;
-                f = new GpuFade(old.from, old.to, a, target, to, sFadeMs, done);
+                f = new GpuFade(old.from, old.to, a, target, to, durMs, done);
                 f.inherit = old;
                 f.armed = old.armed;
                 f.t0 = old.armed ? SystemClock.uptimeMillis() : 0L;
@@ -1444,10 +1602,10 @@ public class WallpaperProbe {
                         && near.getHeight() == to.getHeight()) {
                     from = near;
                 }
-                f = startFreshGpuFade(from, to, done);
+                f = startFreshGpuFade(from, to, done, durMs);
             }
         } else {
-            f = startFreshGpuFade(from, to, done);
+            f = startFreshGpuFade(from, to, done, durMs);
         }
         final android.view.Choreographer ch = android.view.Choreographer.getInstance();
         ch.postFrameCallback(new android.view.Choreographer.FrameCallback() {
@@ -1458,6 +1616,8 @@ public class WallpaperProbe {
                     // The GL thread stopped drawing - the screen went off, most likely. End it
                     // with a real reload: what is uploaded is the far end only for a fade that
                     // lands on its underneath picture, not for one waiting on its swap.
+                    sLastFade = "TIMED OUT after " + f.frames + " frames (armed=" + f.armed
+                            + ", swap=" + f.swapRequested + "/" + f.swapUploaded + ")";
                     Xp.log(TAG + "gpu fade timed out after " + f.frames + " frames (armed="
                             + f.armed + ", swap=" + f.swapRequested + "/" + f.swapUploaded + ")");
                     finishGpuFade(f);
@@ -1471,8 +1631,8 @@ public class WallpaperProbe {
     }
 
     /** A fade from `from` to `to` from the start: one reload uploads `to` underneath. */
-    private static GpuFade startFreshGpuFade(Bitmap from, Bitmap to, Runnable done) {
-        GpuFade f = new GpuFade(from, to, 1f, 0f, to, sFadeMs, done);
+    private static GpuFade startFreshGpuFade(Bitmap from, Bitmap to, Runnable done, long durMs) {
+        GpuFade f = new GpuFade(from, to, 1f, 0f, to, durMs, done);
         sUploadOverride = to;
         sGpuFade = f;
         reloadEngine(sKeyguardEngine, true);
@@ -1600,6 +1760,8 @@ public class WallpaperProbe {
             new Handler(Looper.getMainLooper()).post(new Runnable() {
                 @Override
                 public void run() {
+                    sLastFade = "done in " + (SystemClock.uptimeMillis() - f.startedAt) + "ms, "
+                            + f.frames + " frames, armed=" + f.armed;
                     Xp.log(TAG + "gpu fade done in " + (SystemClock.uptimeMillis() - f.startedAt)
                             + "ms from the request, alpha " + Math.round(f.a0 * 100f) / 100f
                             + " -> " + f.a1 + ", " + f.frames + " frames over " + f.durMs
@@ -1846,6 +2008,25 @@ public class WallpaperProbe {
                         // Whatever arrives now is newer than a composition still in progress,
                         // which would otherwise land after it and put an older cover back.
                         if (!i.hasExtra("src")) sSrcSeq++;
+                        // What the lyrics want of THIS cover. See applyArt(), which is where it
+                        // takes effect; older builds of SystemUI send no such extra.
+                        if (i.hasExtra("lyricblur")) {
+                            sLyricBlurWant = i.getBooleanExtra("lyricblur", false);
+                        }
+                        if (i.hasExtra("tsent")) {
+                            sTmT0 = i.getLongExtra("t0", 0L);
+                            sTmSkip = i.getLongExtra("tskip", 0L);
+                            sTmSkipDir = i.getIntExtra("skipdir", 0);
+                            sTmBurst = i.getLongExtra("tburst", 0L);
+                            sTmSkips = i.getIntExtra("skips", 0);
+                            sTmArt = i.getLongExtra("tart", 0L);
+                            sTmSent = i.getLongExtra("tsent", 0L);
+                            sTmCheckMs = i.getLongExtra("checkms", 0L);
+                            sTmTries = i.getIntExtra("tries", 0);
+                            sTmRecv = SystemClock.uptimeMillis();
+                            sTmRead = sTmComposed = sTmFrosted = sTmMain = sTmUploaded = 0L;
+                            sTmKind = i.hasExtra("src") ? "source" : "jpeg";
+                        }
                         if (i.getBooleanExtra("off", false)) {
                             // A live wallpaper has no texture to fade back to - the way back
                             // is handing the surface to its player again.
@@ -1871,6 +2052,8 @@ public class WallpaperProbe {
                                         sFitted = null;
                                         sFittedOf = null;
                                         sLyricBlur = false;
+                                        sLyricBlurWant = false;
+                                        dropFrosted();
                                         new File(cc.getFilesDir(), ART_FILE).delete();
                                         new File(cc.getFilesDir(), SRC_FILE).delete();
                                         Xp.log(TAG + "art cleared");
@@ -1881,6 +2064,8 @@ public class WallpaperProbe {
                             sCurrentArtChecksum = 0;
                             sArt = null;
                             sLyricBlur = false;
+                            sLyricBlurWant = false;
+                            dropFrosted();
                             new File(c.getFilesDir(), ART_FILE).delete();
                             new File(c.getFilesDir(), SRC_FILE).delete();
                             Xp.log(TAG + "art cleared");
@@ -1897,6 +2082,14 @@ public class WallpaperProbe {
                             // decodeFile() so that the rest of this is unchanged: the same
                             // decoder scales to the texture, and the same bytes are what gets
                             // written to this process's own copy on disk for the next start.
+                            // A composed picture arriving means SystemUI does not know this
+                            // process composes for itself: its question or our answer went
+                            // missing, which is what happens when both processes restart at once
+                            // and each one's hello lands before the other has a receiver. Left
+                            // alone it stands for the life of the process, and every track then
+                            // pays for a full-screen compose AND a JPEG encode (~180ms measured)
+                            // over there, plus the decode here. Answering again fixes the next one.
+                            sayHello(c);
                             if (jpg == null && file != null) jpg = readBytes(file);
                             Bitmap b = null;
                             if (jpg != null) {
@@ -1944,6 +2137,11 @@ public class WallpaperProbe {
                         long v = i.getIntExtra("v", (int) sFadeMs);
                         sFadeMs = v < 60L ? 60L : (v > 1200L ? 1200L : v);
                         Xp.log(TAG + "crossfade is now " + sFadeMs + "ms");
+                    } else if ("trackfadems".equals(op)) {
+                        long v = i.getIntExtra("v", (int) sTrackFadeMs);
+                        // Floored at a frame: the GPU fade divides by this.
+                        sTrackFadeMs = v < 16L ? 16L : (v > 1200L ? 1200L : v);
+                        Xp.log(TAG + "track-change crossfade is now " + sTrackFadeMs + "ms");
                     } else if ("hello".equals(op)) {
                         sayHello(c);
                     } else if ("gpufade".equals(op)) {
@@ -1975,6 +2173,14 @@ public class WallpaperProbe {
                         onKeyguardStateChanged(sVideoEngine, showing, "broadcast");
                     } else if ("vgl".equals(op)) {
                         videoWindowTakeover(i.getBooleanExtra("on", true));
+                    } else if ("timing".equals(op)) {
+                        String rep = timingReport();
+                        for (String line : rep.split("\n")) Xp.log(TAG + line);
+                        setResultData(rep);
+                    } else if ("selftest".equals(op)) {
+                        String rep = selfTest();
+                        for (String line : rep.split("\n")) Xp.log(TAG + line);
+                        setResultData(rep);
                     } else {
                         Xp.log(TAG + "ops: cls --es name <fqcn> [--es grep x]"
                                 + " | bmp --es name <fqcn>");
@@ -1992,11 +2198,83 @@ public class WallpaperProbe {
     }
 
     /**
+     * The last track change, segment by segment.
+     *
+     * Segments are printed only where both ends were actually stamped, so the JPEG path - which
+     * has no source read and no composition on this side - reports what it did rather than a row
+     * of zeroes claiming it was instant.
+     */
+    private static String timingReport() {
+        if (sTmRecv == 0L) {
+            return "=== cover timing ===\nno push seen yet."
+                    + " Change a track with the lock screen up, then ask again.";
+        }
+        StringBuilder sb = new StringBuilder("=== cover timing === (" + sTmKind + " path)");
+        // Absolute, so a press stamped outside this process (`cut -d" " -f1 /proc/uptime` in the
+        // same shell command as the key event) can be subtracted from it: what is left is the
+        // player's own share, which is the part none of the segments below can see.
+        sb.append("\n  the module saw the new track at (uptime): ").append(sTmT0).append("ms");
+        // The head start: the press, heard in SystemUI, against the player getting round to
+        // saying so. This is the room a prefetch would have to work in.
+        if (sTmSkip > 0L && sTmT0 > sTmSkip) {
+            sb.append("\n  the PLAYER took: ").append(sTmT0 - sTmSkip)
+                    .append("ms to report the ")
+                    .append(sTmSkipDir < 0 ? "previous" : "next")
+                    .append(" track (we knew the moment it was asked for)");
+        }
+        seg(sb, "waiting for the artwork", sTmT0, sTmArt,
+                sTmTries > 0 ? sTmTries + (sTmTries == 1 ? " try" : " tries") : null);
+        seg(sb, "  of which the wallpaper check", sTmCheckMs);
+        seg(sb, "preparing and writing it", sTmArt, sTmSent, null);
+        seg(sb, "broadcast in flight", sTmSent, sTmRecv, null);
+        seg(sb, "reading the source", sTmRecv, sTmRead, null);
+        seg(sb, "composing", sTmRead, sTmComposed, null);
+        seg(sb, "frosting for the lyrics", sTmComposed, sTmFrosted, null);
+        seg(sb, "on to the main thread", sTmFrosted > 0 ? sTmFrosted : sTmComposed, sTmMain, null);
+        seg(sb, "uploading the texture", sTmMain, sTmUploaded, null);
+        long end = sTmUploaded > 0L ? sTmUploaded : sTmMain;
+        if (sTmT0 > 0L && end > sTmT0) {
+            sb.append("\n  ---\n  this press to cover on screen: ").append(end - sTmT0)
+                    .append("ms");
+        }
+        // What someone pressing next repeatedly actually watches: the presses in between were
+        // thrown away, and the screen held the old cover for all of it.
+        if (sTmBurst > 0L && end > sTmBurst && sTmSkips > 0) {
+            sb.append("\n  FIRST press of this burst to cover on screen: ")
+                    .append(end - sTmBurst).append("ms (")
+                    .append(sTmSkips).append(" more press")
+                    .append(sTmSkips == 1 ? "" : "es").append(" swallowed on the way)");
+        }
+        // The two halves of the lyrics' blur. They disagreeing is the bug where a track changed
+        // at the moment the lyrics arrived and the cover stayed sharp for the rest of the song:
+        // `want` is what SystemUI last asked for, `on` is what the cover is actually drawn with.
+        sb.append("\nlyric blur: ").append(sLyricBlur ? "on" : "off")
+                .append(", asked for: ").append(sLyricBlurWant ? "on" : "off")
+                .append(sLyricBlur == sLyricBlurWant ? "" : "   <- OUT OF STEP");
+        sb.append("\ncrossfade after that: ").append(sTrackFadeMs)
+                .append("ms on a track change, ").append(sFadeMs)
+                .append("ms entering or leaving cover mode");
+        return sb.toString();
+    }
+
+    private static void seg(StringBuilder sb, String name, long from, long to, String note) {
+        if (from <= 0L || to <= 0L || to < from) return;
+        sb.append("\n  ").append(name).append(": ").append(to - from).append("ms");
+        if (note != null) sb.append(" (").append(note).append(')');
+    }
+
+    private static void seg(StringBuilder sb, String name, long ms) {
+        if (ms <= 0L) return;
+        sb.append("\n  ").append(name).append(": ").append(ms).append("ms");
+    }
+
+    /**
      * Frosts the cover for the lyrics, or clears it. The blur is made on the composer thread; the
      * fade waits for one already in the air - the cover arriving, a track changing - to land
      * first, because a new fade starts from the picture it is handed, not from what is on screen.
      */
     private static void setLyricBlur(final boolean on) {
+        sLyricBlurWant = on;
         composer().post(new Runnable() {
             @Override
             public void run() {
@@ -2007,6 +2285,10 @@ public class WallpaperProbe {
                 h.post(new Runnable() {
                     @Override
                     public void run() {
+                        // Overtaken while this one was waiting out a fade. The wait re-posts,
+                        // so a newer switch reaches the main thread first and this one would
+                        // otherwise land afterwards and undo it.
+                        if (on != sLyricBlurWant) return;
                         if (on == sLyricBlur) return;
                         if ((sFade != null || sGpuFade != null)
                                 && SystemClock.uptimeMillis() - t0 < 1500L) {
@@ -2046,9 +2328,15 @@ public class WallpaperProbe {
      * Main thread.
      */
     private static void applyArt(Bitmap b, boolean reload, boolean fade) {
+        sTmMain = SystemClock.uptimeMillis();
         // Read before sArt moves: on the way into cover mode this is the lock wallpaper, and on
         // a track change it is the album that is on screen right now.
         Bitmap from = fittedArt();
+        // Already showing a cover means this picture replaces another one: a track change, which
+        // is the fade that has nothing to keep company with and gets the short duration. With no
+        // cover yet, what it fades from is the lock wallpaper - that is cover mode opening, and
+        // it travels with the clock. See sTrackFadeMs.
+        boolean trackChange = from != null;
         if (from == null) from = sOrig;
         // On a live lock wallpaper the cover that is on screen is the art
         // this process already holds, whether or not it could be "fitted"
@@ -2059,6 +2347,14 @@ public class WallpaperProbe {
         // the composed cover video is built; the still path hands it
         // straight to startFade() below.
         sFadeFrom = from;
+        // A cover carries what the lyrics wanted at the moment it was sent, so a track change is
+        // also where the two processes settle any disagreement: a lost broadcast, or a switch
+        // that never landed. Applied after `from` and before `to`, so the new cover simply
+        // arrives with the right finish instead of fading in sharp and frosting a beat later.
+        if (sLyricBlur != sLyricBlurWant) {
+            sLyricBlur = sLyricBlurWant;
+            Xp.log(TAG + "lyric blur " + (sLyricBlur ? "on" : "off") + " with the new cover");
+        }
         sArt = b;
         sAsks = 0;
         sFitted = null;
@@ -2066,8 +2362,9 @@ public class WallpaperProbe {
         Bitmap to = fittedArt();   // scale here, not on the GL thread
         Xp.log(TAG + "art set " + describe(b));
         if (videoPath()) videoWindowTakeover(false);
-        else if (fade && from != null && to != null) startFade(from, to, null);
-        else if (reload) reloadTexture();
+        else if (fade && from != null && to != null) {
+            startFade(from, to, null, trackChange ? sTrackFadeMs : sFadeMs);
+        } else if (reload) reloadTexture();
     }
 
     /** Where this process keeps the last source, to compose again after its own restart. */
@@ -2110,9 +2407,24 @@ public class WallpaperProbe {
                         return;
                     }
                     read = SystemClock.uptimeMillis();
+                    sTmRead = read;
                     if (seq != sSrcSeq) return;
                     b = CoverCompose.composeWallpaper(s.src, s.w, s.h, s.bias);
                     composed = SystemClock.uptimeMillis();
+                    sTmComposed = composed;
+                    // Under the lyrics the picture that actually goes up is the frosted copy, and
+                    // making it is another full-screen blur. Left to applyArt() it would be made
+                    // on the main thread, in front of the crossfade the track change is waiting
+                    // on. Made here it is already in the cache by the time that asks - keyed on
+                    // this very bitmap, so it only hits when the composition is texture-sized,
+                    // which is the normal case (the texture is composed to the screen).
+                    if (sLyricBlurWant && b.getWidth() == sReportedW && b.getHeight() == sReportedH) {
+                        // Built from the source and the layout, not from `b` - see
+                        // CoverCompose.frostedFor() - but cached under `b`, which is what every
+                        // reader asks with once this becomes the art.
+                        cacheFrosted(b, CoverCompose.frostedFor(s.src, s.w, s.h, s.bias));
+                    }
+                    sTmFrosted = SystemClock.uptimeMillis();
                     saveSourceLater(c, s);
                 } catch (Throwable t) {
                     Xp.log(TAG + "composing from the source failed: " + t);
@@ -2169,6 +2481,12 @@ public class WallpaperProbe {
             // What settles the pairing is the rest of that set: changeScrollWithScreen and g
             // kept their names across both builds, and those are what align the two lists.
             {"U", Boolean.FALSE},
+            // 8.0.8-flip-q18's name, off its bytecode: ImageEngineImpl.Z(Z) opens on
+            // `iget-boolean s:Z; if-eqz -> return; iget-object k:Handler; Handler.post(Runnable)`,
+            // which is the same post-a-frame shape as T/U above with the fields renamed (that
+            // build's guard is s where 7.0.7's is h). The sibling V(Z) is 563 code units of
+            // surface work and is NOT this - it is the one to avoid calling by accident.
+            {"Z", Boolean.FALSE},
             // The OEM's own showKeyguardWallpaper(ZI)/hideKeyguardWallpaper(ZI) take a boolean
             // and an int, so a build that widened the frame request the same way is worth one
             // more try. 0 is the no-animation value everywhere these appear.
@@ -2255,6 +2573,110 @@ public class WallpaperProbe {
         reloadEngine(eng);
     }
 
+    /**
+     * Records an engine instance and says what distinguishes it from the others.
+     *
+     * The int fields are dumped because on the multi-display build they are what tells the
+     * instances apart: MultiDisplayEngineService.b is `which` - the value
+     * MiuiWallpaperManager.isLockWhich reads to separate the lock engine from the desktop one -
+     * and c is what it passes to WallpaperServiceController alongside it. Neither is named in a
+     * way that can be relied on, so they are reported rather than interpreted.
+     */
+    private static void noteEngineInstance(Object eng) {
+        if (eng == null) return;
+        if (!sKeyguardEngines.contains(eng)) sKeyguardEngines.add(eng);
+        Xp.log(TAG + "keyguard engine #" + sKeyguardEngines.size() + ": " + describeEngine(eng));
+    }
+
+    /** One engine instance: its class, its identity, and every int it carries. */
+    private static String describeEngine(Object eng) {
+        StringBuilder sb = new StringBuilder(eng.getClass().getSimpleName())
+                .append('@').append(Integer.toHexString(System.identityHashCode(eng)));
+        try {
+            for (Class<?> k = eng.getClass(); k != null && k != Object.class;
+                 k = k.getSuperclass()) {
+                for (java.lang.reflect.Field f : k.getDeclaredFields()) {
+                    if (f.getType() != int.class || Modifier.isStatic(f.getModifiers())) continue;
+                    f.setAccessible(true);
+                    sb.append(' ').append(k.getSimpleName()).append('.').append(f.getName())
+                            .append('=').append(f.getInt(eng));
+                }
+            }
+        } catch (Throwable t) {
+            sb.append(" (ints unreadable: ").append(t).append(')');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Everything a port to an unseen build needs, in one answer.
+     *
+     * Written for the case where the phone is someone else's: they run this once (or just send
+     * the LSPosed log, which this also goes to) and it has to be enough to work out what moved,
+     * without a second round trip. So it reports what was RESOLVED, what it was resolved to, and
+     * the candidates for anything that was not - never just "failed".
+     */
+    static String selfTest() {
+        StringBuilder sb = new StringBuilder("=== wallpaper self test ===");
+        sb.append("\nwallpaper package: ").append(wallpaperVersion());
+        sb.append('\n').append(EngineNames.report());
+        sb.append("\nkeyguard engines: ").append(sKeyguardEngines.size());
+        synchronized (sKeyguardEngines) {
+            for (int n = 0; n < sKeyguardEngines.size(); n++) {
+                Object e = sKeyguardEngines.get(n);
+                sb.append("\n  #").append(n + 1).append(' ').append(describeEngine(e))
+                        .append(e == sKeyguardEngine ? "   <- the one being pushed to" : "");
+            }
+        }
+        sb.append("\ndesktop engine: ").append(sDesktopEngine == null ? "none"
+                : describeEngine(sDesktopEngine));
+        sb.append("\nvideo engine: ").append(sVideoEngine == null ? "none"
+                : sVideoEngine.getClass().getSimpleName());
+        sb.append("\nframe request: ").append(sFrameReq < 0 ? "none has answered yet"
+                : FRAME_REQUESTS[sFrameReq][0] + "() (candidate " + (sFrameReq + 1) + " of "
+                        + FRAME_REQUESTS.length + ")");
+        Object eng = sKeyguardEngine;
+        if (eng != null) {
+            sb.append("\n  (Z)V methods here: ").append(oneBooleanMethods(eng));
+        }
+        // The three numbers that decide where the picture lands. On one screen they are always
+        // the same; where they differ, they name the two screens that got crossed.
+        sb.append("\nrender state: ").append(sRenderState.isEmpty() ? "no upload yet" : sRenderState);
+        sb.append("\nsurface adopted: ").append(sSurfaceW).append('x').append(sSurfaceH);
+        synchronized (sTexSizes) {
+            sb.append("\ntexture sizes held: ").append(sTexSizes.size());
+            for (java.util.Map.Entry<Object, android.graphics.Rect> e : sTexSizes.entrySet()) {
+                sb.append("\n  ").append(e.getKey().getClass().getSimpleName())
+                        .append('@').append(Integer.toHexString(System.identityHashCode(e.getKey())))
+                        .append(" -> ").append(e.getValue().width()).append('x')
+                        .append(e.getValue().height())
+                        .append(e.getKey() == sKeyguardTexture ? "  <- current" : "");
+            }
+        }
+        sb.append("\ncuts held: ").append(sScreenArts.size());
+        sb.append("\nart: ").append(describe(sArt)).append("  orig: ").append(describe(sOrig));
+        sb.append("\ntexture: ").append(sKeyguardTexture == null ? "not captured" : "captured");
+        sb.append("\ngpu fade: on=").append(sGpuFadeOn).append(" hooked=").append(sDrawHooked)
+                .append(" broken=").append(sGpuFadeBroken);
+        // How the last transition actually ended. "TIMED OUT ... armed=false" is the shape of a
+        // frame request that the OEM accepted and did nothing with.
+        sb.append("\nlast fade: ").append(sLastFade);
+        return sb.toString();
+    }
+
+    /** The wallpaper app's own version, which is what a report has to be read against. */
+    private static String wallpaperVersion() {
+        try {
+            Context c = sCtx;
+            if (c == null) return "unknown (no context)";
+            android.content.pm.PackageInfo pi =
+                    c.getPackageManager().getPackageInfo(c.getPackageName(), 0);
+            return pi.packageName + " " + pi.versionName + " (" + pi.versionCode + ")";
+        } catch (Throwable t) {
+            return "unknown: " + t;
+        }
+    }
+
     private static void reloadEngine(Object eng) {
         reloadEngine(eng, false);
     }
@@ -2273,10 +2695,20 @@ public class WallpaperProbe {
         } catch (Throwable t) {
             Xp.log(TAG + "reload: u() failed: " + t);
         }
-        try {
-            Xp.setBooleanField(eng, "b", true);
-        } catch (Throwable t) {
-            Xp.log(TAG + "reload: the pending-surface field failed: " + t);
+        // Resolved, never assumed. On the multi-display build this flag is called `w`, and the
+        // name `b` that it has on 7.0.7 belongs there to an int holding `which` - so writing `b`
+        // blind is not a miss, it is a write onto the engine's own lock-or-desktop identity.
+        // EngineNames only hands back a name it has confirmed is a boolean.
+        String flag = EngineNames.pendingFlag;
+        if (flag == null) {
+            Xp.log(TAG + "reload: no pending-surface flag resolved; the frame will redraw what is "
+                    + "uploaded instead of re-reading it. " + EngineNames.report());
+        } else {
+            try {
+                Xp.setBooleanField(eng, flag, true);
+            } catch (Throwable t) {
+                Xp.log(TAG + "reload: the pending-surface field '" + flag + "' failed: " + t);
+            }
         }
         if (frameRequest(eng, keepAlive)) {
             // Not per frame: a fade asks for a reload every frame, and this log goes through
@@ -2296,13 +2728,25 @@ public class WallpaperProbe {
         if (eng != null && !frameRequest(eng, keepAlive)) reportNoFrameRequest(eng);
     }
 
+    /**
+     * Whether an entry's boolean is the one that DEFERS the post-render teardown, read off that
+     * build's own bytecode and never guessed.
+     *
+     * Index-aligned with FRAME_REQUESTS. True only where the dex has been read: T and U hand
+     * their argument to the post-render step, where false runs finishRendering() on the spot -
+     * the EGL surface and context destroyed after the frame - and true defers it by a second.
+     * Z's boolean is a different question entirely (whether preRender re-reads the texture), and
+     * the T(Z,I) entry is a shape nobody has met yet, so neither of those is ever given ours.
+     */
+    private static final boolean[] FRAME_REQ_DEFERS_TEARDOWN = {true, true, false, false};
+
     /** Tries the known frame requests, the one that answered last time first. */
     private static boolean frameRequest(Object eng, boolean keepAlive) {
         int known = sFrameReq;
-        if (known >= 0 && callFrameRequest(eng, FRAME_REQUESTS[known], keepAlive)) return true;
+        if (known >= 0 && callFrameRequest(eng, known, keepAlive)) return true;
         for (int i = 0; i < FRAME_REQUESTS.length; i++) {
             if (i == known) continue;
-            if (callFrameRequest(eng, FRAME_REQUESTS[i], keepAlive)) {
+            if (callFrameRequest(eng, i, keepAlive)) {
                 sFrameReq = i;
                 return true;
             }
@@ -2310,10 +2754,34 @@ public class WallpaperProbe {
         return false;
     }
 
-    private static boolean callFrameRequest(Object eng, Object[] req, boolean keepAlive) {
+    private static boolean callFrameRequest(Object eng, int entry, boolean keepAlive) {
+        Object[] req = FRAME_REQUESTS[entry];
         Object[] args = new Object[req.length - 1];
         System.arraycopy(req, 1, args, 0, args.length);
-        if (args.length > 0 && args[0] instanceof Boolean) args[0] = keepAlive;
+        // The argument is the OEM's, not ours, everywhere its meaning has not been read out of
+        // that build's bytecode. It used to be overwritten with keepAlive unconditionally, which
+        // sent `true` where FRAME_REQUESTS deliberately says FALSE, the no-animation value at
+        // every one of these entry points.
+        //
+        // On 7.0.7 that went unnoticed: the frame request there is U(Z), which reaches preRender
+        // either way. On 8.0.8-flip the frame request is Z(Z), which posts preRender - V(Z),
+        // named by its own "#preRender" trace section - and THAT one branches on the argument.
+        // With true it never re-read the texture, so a GPU fade armed on nothing: measured as
+        // `gpu fade timed out after 226 frames (armed=false)`, about 1.9s of the cover sitting
+        // in the wallpaper process without being drawn, which is what read on the phone as the
+        // cover taking seconds to appear and needing a fold or a rotation to show up.
+        //
+        // Where the boolean IS the teardown flag, though, ours is the right value and sending
+        // the OEM's costs the whole animation: a run of frames asked for with false destroys the
+        // EGL context after every one of them, and the next frame is a new context, which the
+        // engine treats as a new surface and re-uploads everything for. That is a fade at 9-17
+        // frames where the same fade with true draws 44-46 - the difference between a crossfade
+        // and a slideshow, and what made the frost going on for the lyrics stutter.
+        if (keepAlive && entry < FRAME_REQ_DEFERS_TEARDOWN.length
+                && FRAME_REQ_DEFERS_TEARDOWN[entry]
+                && args.length > 0 && args[0] instanceof Boolean) {
+            args[0] = Boolean.TRUE;
+        }
         try {
             Xp.callMethod(eng, (String) req[0], args);
             return true;
@@ -3394,16 +3862,25 @@ public class WallpaperProbe {
      * Null for the three cases that must not be touched: the experiment is off, the surface size
      * is not known yet (the first upload of a process runs before onSurfaceChanged has set it),
      * or the bitmap is already that size. Cached per source, because the source is either the
-     * module's own art or the OEM's one wallpaper and both repeat.
+     * module's own art or the OEM's one wallpaper and both repeat - and per SIZE within that,
+     * because a foldable alternates between its screens and each wants its own cut.
+     *
+     * The size comes from sSurfaceW/H, which the caller has just read off the renderer doing
+     * this upload. Taking it from anywhere else is what cropped the cover for one screen and
+     * handed it to another.
      */
     private static Bitmap screenSized(Bitmap src) {
         int w = sSurfaceW, h = sSurfaceH;
         if (!sTexFit || src == null || w <= 0 || h <= 0) return null;
         if (src.getWidth() == w && src.getHeight() == h) return null;
-        if (sScreenArt != null && sScreenArtOf == src
-                && sScreenArt.getWidth() == w && sScreenArt.getHeight() == h) {
-            return sScreenArt;
+        // A new source makes every cut of the old one useless at once.
+        if (sScreenArtOf != src) {
+            sScreenArts.clear();
+            sScreenArtOf = src;
         }
+        Long key = ((long) w << 32) | (h & 0xffffffffL);
+        Bitmap have = sScreenArts.get(key);
+        if (have != null && !have.isRecycled()) return have;
         Bitmap fitted;
         try {
             fitted = centerCrop(src, w, h);
@@ -3411,12 +3888,14 @@ public class WallpaperProbe {
             Xp.log(TAG + "screen-size fit failed: " + t);
             return null;
         }
-        Bitmap old = sScreenArt;
-        if (old != null && old != src && old != sArt) old.recycle();
-        sScreenArt = fitted;
-        sScreenArtOf = src;
+        // Nothing is recycled here. The old cut used to be freed on the spot, which is right
+        // when there is one screen and wrong the moment there are two: the other screen's
+        // renderer can still be drawing from the cut this one is replacing, and a recycled
+        // bitmap under GL is a black wallpaper, not an exception anyone sees. The collector
+        // frees them once the map drops them.
+        sScreenArts.put(key, fitted);
         Xp.log(TAG + "texture fitted to the screen: " + describe(src)
-                + " -> " + describe(fitted));
+                + " -> " + describe(fitted) + " (" + sScreenArts.size() + " cut(s) held)");
         return fitted;
     }
 

@@ -66,8 +66,26 @@ final class LockLyrics {
 
     /** A lookup is in the air; the blur is held rather than dropped while it is. */
     private static boolean sLoading;
-    /** What the wallpaper process was last told about the blur. Null = unknown. */
-    private static Boolean sBlurSent;
+    /**
+     * Which route the lines on screen came from, as a LyricSource.SRC_ constant.
+     *
+     * Kept so the session can win later: anything short of the session's own lyric is provisional
+     * and is replaced if one turns up, because a provider module writes it seconds after the
+     * track starts and the key cannot see the difference.
+     */
+    private static int sSource = LyricSource.SRC_NONE;
+    /**
+     * What the wallpaper process was last told about the blur. Null = unknown.
+     *
+     * Volatile because every cover push reads it off the push thread: a track change carries the
+     * answer with it, which is what settles a switch the other process missed.
+     */
+    private static volatile Boolean sBlurSent;
+
+    /** Whether the cover should be frosted right now, for a push to carry over. */
+    static boolean blurWanted() {
+        return Boolean.TRUE.equals(sBlurSent);
+    }
 
     private static boolean sDemo;
     private static long sDemoT0;
@@ -75,11 +93,33 @@ final class LockLyrics {
     private static View sCard;
     private static long sCardLookAt;
 
+    /**
+     * A session has carried its own lyric at some point since SystemUI started.
+     *
+     * The settings page asks, to tell "a provider module is installed" apart from "a provider
+     * module is working". Those are different: LyricInfo is an LSPosed module, and one that is
+     * installed but not enabled, or enabled without the player in its scope, writes nothing at
+     * all while still being present in the package list. Only having read a real lyric off a
+     * session proves the whole chain.
+     */
+    static boolean sSawSessionLyric;
+
+    /** Lines plus the route they came by - a cache hit has to answer both. */
+    private static final class Cached {
+        final List<LyricLine> lines;
+        final int source;
+
+        Cached(List<LyricLine> lines, int source) {
+            this.lines = lines;
+            this.source = source;
+        }
+    }
+
     /** Songs recently shown, so skipping back and forth does not go to the network each time. */
-    private static final Map<String, List<LyricLine>> CACHE =
-            new LinkedHashMap<String, List<LyricLine>>(16, 0.75f, true) {
+    private static final Map<String, Cached> CACHE =
+            new LinkedHashMap<String, Cached>(16, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, List<LyricLine>> e) {
+                protected boolean removeEldestEntry(Map.Entry<String, Cached> e) {
                     return size() > 12;
                 }
             };
@@ -102,13 +142,16 @@ final class LockLyrics {
     /**
      * Whether it should be visible: attached, lit, and the clock settled small.
      *
-     * Not during ENTER. The clock is still full size for most of the entry, and a recording
-     * (2026-09-16 02:23) showed the lyrics arriving on top of it - on a toggle and on a wake
-     * alike. They fade in once the clock has landed instead.
+     * Through ENTER as well, wake or toggle alike: they come up with the clock rather than after
+     * it (user, 2026-09-16 - waiting for the landing made them turn up late). An early version
+     * held them back because a recording (02:23) had them arriving on top of the full-size clock;
+     * that was the band being stale, and it is measured from the clock's live ink every frame
+     * now, so through the flight they follow it down instead.
      */
     static boolean wantsShown() {
         if (!wantsAttached() || !Main.screenOnCached()) return false;
-        return ClockCollapse.phase() == ClockCollapse.Phase.ON;
+        ClockCollapse.Phase p = ClockCollapse.phase();
+        return p == ClockCollapse.Phase.ON || p == ClockCollapse.Phase.ENTER;
     }
 
     /** The media card, looked up again only when the one we hold has left the window. */
@@ -155,16 +198,43 @@ final class LockLyrics {
             if (verbose) Xp.log(TAG + "demo is held, not looking " + key + " up");
             return;
         }
-        if (key.equals(sKey)) return;
+        if (key.equals(sKey)) {
+            // Same song - but not necessarily the same evidence. A provider module (LyricInfo
+            // and the ColorOS ones write the whole lyric to the session; the player itself may
+            // too) cannot publish a lyric until it knows what is playing, so it writes one into
+            // a session that already exists. None of the fields this key is built from change
+            // when it does, which is the point of the key - so without this, the lyric a module
+            // just went and fetched would sit on the session unread for the whole song, and
+            // whatever we settled for in the first second would stand.
+            if (sEnabled && !key.isEmpty() && sSource != LyricSource.SRC_LYRIC_INFO
+                    && !sLoading && LyricSource.hasLyricInfo(c)) {
+                Xp.log(TAG + "the session now carries its own lyric; re-reading " + key);
+                CACHE.remove(key);
+                sKey = "";
+            } else {
+                return;
+            }
+        }
         sKey = key;
+        // The previous song's route says nothing about this one, and leaving it set would let a
+        // track that follows a session-lyric track skip the upgrade check entirely.
+        sSource = LyricSource.SRC_NONE;
         // Set before the lines are emptied, so the blur is held across the lookup instead of
         // being dropped by the empty set and put back when the answer lands.
-        sLoading = sEnabled && !key.isEmpty() && !CACHE.containsKey(key);
+        //
+        // A cached answer counts as a lookup too, short as it is. Excluding it meant the empty
+        // set below sent the blur off and the cache hit one line later sent it straight back on
+        // - two messages, in the middle of the track change's crossfade, which is exactly when
+        // the wallpaper process holds a switch back to wait for the fade. Those two could then
+        // land in the wrong order and leave the cover sharp.
+        sLoading = sEnabled && !key.isEmpty();
         setLines(Collections.<LyricLine>emptyList(), "track changed");
         if (!sEnabled || key.isEmpty()) return;
-        List<LyricLine> hit = CACHE.get(key);
+        Cached hit = CACHE.get(key);
         if (hit != null) {
-            setLines(hit, "cached");
+            sLoading = false;
+            sSource = hit.source;
+            setLines(hit.lines, "cached");
             return;
         }
         final String want = key;
@@ -172,13 +242,32 @@ final class LockLyrics {
         sLoading = true;
         LyricSource.load(c, new LyricSource.Callback() {
             @Override
-            public void onLines(List<LyricLine> lines, String why) {
+            public void onLines(List<LyricLine> lines, String why, int source) {
                 if (gen != sGen || !want.equals(sKey) || sDemo) {
                     Xp.log(TAG + "lyrics for " + want + " arrived after the track changed");
                     return;
                 }
                 sLoading = false;
-                if (!lines.isEmpty()) CACHE.put(want, lines);
+                sSource = source;
+                // What the LAST lookup found, not what any lookup ever found.
+                //
+                // It has to fall as well as rise. Written once and kept, it said "a provider
+                // module is working" for as long as the file lasted - so disabling the module
+                // and restarting left the settings page still convinced, and the advice that
+                // should have appeared never did.
+                //
+                // SRC_NONE is deliberately not an answer either way: finding nothing can mean
+                // the network was down or the song simply has no lyrics anywhere, neither of
+                // which says anything about the provider.
+                if (source == LyricSource.SRC_LYRIC_INFO || source == LyricSource.SRC_DATABASE
+                        || source == LyricSource.SRC_NETEASE) {
+                    boolean fromSession = source == LyricSource.SRC_LYRIC_INFO;
+                    if (fromSession != sSawSessionLyric) {
+                        sSawSessionLyric = fromSession;
+                        Main.saveState();
+                    }
+                }
+                if (!lines.isEmpty()) CACHE.put(want, new Cached(lines, source));
                 setLines(lines, why);
             }
         });
@@ -296,7 +385,7 @@ final class LockLyrics {
         setLines(Collections.<LyricLine>emptyList(), "demo loading");
         LyricSource.loadById(id, apple, new LyricSource.Callback() {
             @Override
-            public void onLines(List<LyricLine> lines, String why) {
+            public void onLines(List<LyricLine> lines, String why, int source) {
                 if (gen != sGen || !sDemo) return;
                 sLoading = false;
                 sDemoT0 = SystemClock.uptimeMillis();
@@ -315,12 +404,28 @@ final class LockLyrics {
         refresh();
     }
 
+    /** The SRC_ constant as something readable in a broadcast result. */
+    private static String srcName(int source) {
+        switch (source) {
+            case LyricSource.SRC_LYRIC_INFO:
+                return "session";
+            case LyricSource.SRC_DATABASE:
+                return "amll";
+            case LyricSource.SRC_NETEASE:
+                return "netease";
+            default:
+                return "none";
+        }
+    }
+
     static String describe() {
         LyricView v = sView;
         View c = Main.sContainer;
         View card = card();
         return "enabled=" + sEnabled + " demo=" + sDemo + " key=" + sKey + " lines=" + sLines.size()
-                + " (" + sWhy + ") pos=" + positionMs() + " playing=" + playing()
+                + " (" + sWhy + ") src=" + srcName(sSource)
+                + " sessionHasLyric=" + LyricSource.hasLyricInfo(sController)
+                + " pos=" + positionMs() + " playing=" + playing()
                 + " cover=" + Main.coverModeOn() + " screen=" + Main.screenOnCached()
                 + " phase=" + ClockCollapse.phase() + " cardP=" + Main.cardProgress()
                 + " container=" + (c == null ? "none" : c.getAlpha() + "/shown=" + c.isShown())

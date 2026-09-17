@@ -155,10 +155,34 @@ final class CoverCompose {
         if (bias > 1f) bias = 1f;
         float top = (h - coverH) * bias;
 
-        // Blurring a centre-crop gave a muddy wash whose colours did not meet the sharp cover at
-        // the seam. Extend the artwork by MIRRORING it above and below instead: the rows either
-        // side of a seam are then the same row of the artwork, so the join is continuous by
-        // construction, and the blur keeps local colour instead of averaging the whole image.
+        Bitmap bg = mirroredBackground(src, w, h, bias);
+        Bitmap blurred = blur(bg, 48, 4, 3);
+        cv.drawBitmap(blurred, null, new android.graphics.RectF(0, 0, w, h), p);
+        cv.drawColor(0x14000000);
+        // The sharp band, feathered in its own pixels and then drawn in one go. See feathered().
+        Bitmap band = feathered(src, w, Math.round(coverH),
+                Math.min(240, Math.round(coverH / 4f)));
+        cv.drawBitmap(band, null, new android.graphics.RectF(0, top, w, top + coverH), p);
+        band.recycle();
+        return out;
+    }
+
+    /**
+     * The quarter-size backdrop the composition blurs: the artwork at its place in the layout,
+     * mirrored away from there until it fills the screen.
+     *
+     * Blurring a centre-crop gave a muddy wash whose colours did not meet the sharp cover at the
+     * seam. Extending the artwork by MIRRORING it means the rows either side of a seam are the
+     * same row of the artwork, so the join is continuous by construction, and the blur keeps
+     * local colour instead of averaging the whole image.
+     *
+     * Its own method because the lyrics' frosted copy is built from the same backdrop - see
+     * frostedFor(), which is the whole reason that copy no longer costs more than the
+     * composition it follows.
+     */
+    private static Bitmap mirroredBackground(Bitmap src, int w, int h, float bias) {
+        float coverH = src.getHeight() * (w / (float) src.getWidth());
+        float top = (h - coverH) * bias;
         int bw = Math.max(1, w / 4), bh = Math.max(1, h / 4);
         float k = bw / (float) w;
         // Floored at a pixel: a panorama's band is a fraction of a row, and the loop below counts
@@ -166,6 +190,8 @@ final class CoverCompose {
         float cH = Math.max(1f, coverH * k), tp = top * k;
         Bitmap bg = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
         android.graphics.Canvas bc = new android.graphics.Canvas(bg);
+        android.graphics.Paint p = new android.graphics.Paint(
+                android.graphics.Paint.FILTER_BITMAP_FLAG);
         bc.drawBitmap(src, null, new android.graphics.RectF(0, tp, bw, tp + cH), p);
         // One mirrored copy each way is what this was, and it covers the background only while
         // the band is a large part of the screen: a square cover puts it at 1200 of 2608 and the
@@ -180,16 +206,7 @@ final class CoverCompose {
             drawTile(bc, src, bw, cH, tp + i * cH, flip, p);
             drawTile(bc, src, bw, cH, tp - i * cH, flip, p);
         }
-
-        Bitmap blurred = blur(bg, 48, 4, 3);
-        cv.drawBitmap(blurred, null, new android.graphics.RectF(0, 0, w, h), p);
-        cv.drawColor(0x14000000);
-        // The sharp band, feathered in its own pixels and then drawn in one go. See feathered().
-        Bitmap band = feathered(src, w, Math.round(coverH),
-                Math.min(240, Math.round(coverH / 4f)));
-        cv.drawBitmap(band, null, new android.graphics.RectF(0, top, w, top + coverH), p);
-        band.recycle();
-        return out;
+        return bg;
     }
 
     /**
@@ -256,18 +273,63 @@ final class CoverCompose {
      * a little first, because darkening alone turns a bright cover grey.
      */
     static Bitmap frosted(Bitmap src) {
-        int w = src.getWidth(), h = src.getHeight();
-        Bitmap soft = blur(src, 36, 3, 3);
-        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        android.graphics.Canvas cv = new android.graphics.Canvas(out);
-        android.graphics.Paint p = new android.graphics.Paint(
+        return frostedOf(blur(src, 36, 3, 3), src, src.getWidth(), src.getHeight());
+    }
+
+    /**
+     * The same frosted cover, built from the layout instead of from the finished composition.
+     *
+     * Measured on device, 1200x2608: frosted() cost 110ms a track change - more than composing
+     * the cover it follows - and nearly all of it went on carrying a full-screen picture down to
+     * 36 pixels wide, one halving at a time, to throw away everything but its colour. The
+     * backdrop the composition already builds is that colour, at a quarter of the size and with
+     * the artwork in the same place, so blurring THAT to 36 lands on the same pixels for a
+     * sixteenth of the work.
+     *
+     * Two things the finished composition has that this does not: the sharp band, which is the
+     * same artwork in the same place and vanishes at 36 pixels either way, and the 8% darkening
+     * over the backdrop, which is applied here so the two paths agree.
+     */
+    static Bitmap frostedFor(Bitmap src, int w, int h, float bias) {
+        Bitmap bg = mirroredBackground(src, w, h, bias);
+        Bitmap soft = blur(bg, 36, 3, 3);
+        if (soft != bg) bg.recycle();
+        Bitmap out = frostedOf(soft, null, w, h);
+        return out;
+    }
+
+    /**
+     * The shared tail: a blurred picture stretched over the whole screen, saturated a little
+     * because darkening alone turns a bright cover grey, and then darkened so white text reads
+     * over any of it. `keep` is the caller's own bitmap, never recycled here.
+     */
+    private static Bitmap frostedOf(Bitmap soft, Bitmap keep, int w, int h) {
+        // Coloured at the blur's own size, then stretched once.
+        //
+        // Saturating and darkening are per-pixel linear operations and so is the stretch, so the
+        // two orders land on the same colours - but after the stretch they run over every pixel
+        // of the screen, three times, and before it they run over a sixteenth as many. The stretch
+        // itself still has to happen either way; what this removes is the work on top of it.
+        int sw = soft.getWidth(), sh = soft.getHeight();
+        Bitmap small = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas sc = new android.graphics.Canvas(small);
+        android.graphics.Paint sp = new android.graphics.Paint(
                 android.graphics.Paint.FILTER_BITMAP_FLAG);
         android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
         cm.setSaturation(1.3f);
-        p.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
-        cv.drawBitmap(soft, null, new android.graphics.RectF(0, 0, w, h), p);
-        cv.drawColor(0x61000000);
-        if (soft != src) soft.recycle();
+        sp.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+        sc.drawBitmap(soft, 0f, 0f, sp);
+        // 0x14 is the wash composeWallpaper() lays over its own backdrop; 0x61 is the frosting.
+        // Both, so a cover frosted from the layout matches one frosted from the composition.
+        if (keep == null) sc.drawColor(0x14000000);
+        sc.drawColor(0x61000000);
+        if (soft != keep) soft.recycle();
+
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        new android.graphics.Canvas(out).drawBitmap(small, null,
+                new android.graphics.RectF(0, 0, w, h),
+                new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG));
+        small.recycle();
         return out;
     }
 

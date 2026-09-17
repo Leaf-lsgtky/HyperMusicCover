@@ -75,15 +75,27 @@ object ModuleBridge {
         val track: String = "",
         val player: String = "",
         val mcHideArt: Boolean = false,
-        val mcCenterText: Boolean = false,
+        /** With [mcHideArt] on, show the thumbnail anyway while the lyrics are up. */
+        val mcArtInLyrics: Boolean = false,
         val mcTitleTap: Boolean = false,
         val hideFingerprint: Boolean = false,
+        /** Draw the big clock's colon on the styles that drop it. */
+        val forceColon: Boolean = false,
         /** Lock screen lyrics, between the collapsed clock and the card. */
         val lyrics: Boolean = false,
         /** Keep the screen lit while lock screen lyrics are playing. */
         val lyricsKeepOn: Boolean = false,
         /** Draw the singing words brighter than white on an HDR screen. */
         val lyricsHdr: Boolean = false,
+        /**
+         * A session has actually carried its own lyric since SystemUI started.
+         *
+         * Not the same question as whether a provider module is installed, and the difference is
+         * the one worth showing the user: LyricInfo is an LSPosed module, and one that is
+         * installed but not enabled - or enabled without the player in its scope - writes
+         * nothing while still being in the package list.
+         */
+        val sessionLyric: Boolean = false,
         /** 0 system default, 1 never avoid the fingerprint icon, 2 always avoid it. */
         val fpAvoid: Int = 0,
         /**
@@ -182,11 +194,11 @@ object ModuleBridge {
     fun setClockResponse(context: Context, seconds: Float) =
         send(context, "clockspring") { putExtra("v", seconds) }
 
+    fun setCardArtInLyrics(context: Context, on: Boolean) =
+        send(context, "mediacard") { putExtra("lyricart", on) }
+
     fun setCardHideArt(context: Context, on: Boolean) =
         send(context, "mediacard") { putExtra("hideart", on) }
-
-    fun setCardCenterText(context: Context, on: Boolean) =
-        send(context, "mediacard") { putExtra("centertext", on) }
 
     fun setCardTitleTap(context: Context, on: Boolean) =
         send(context, "mediacard") { putExtra("titletap", on) }
@@ -196,6 +208,9 @@ object ModuleBridge {
     // wire would make moving it later a protocol change.
     fun setHideFingerprint(context: Context, on: Boolean) =
         send(context, "hidefp") { putExtra("on", on) }
+
+    fun setForceColon(context: Context, on: Boolean) =
+        send(context, "colon") { putExtra("on", on) }
 
     fun setLyrics(context: Context, on: Boolean) =
         send(context, "lyrics") { putExtra("on", on) }
@@ -227,6 +242,32 @@ object ModuleBridge {
      * module is not there - "not installed" is a normal thing for this screen to display.
      */
     suspend fun query(context: Context): State = fromBundle(ask(context, "query"))
+
+    /**
+     * The same question, asked again until it is answered.
+     *
+     * One query is a 1.5s shot at a process that may be on its way up. "重启全部作用域" kills
+     * SystemUI, and the module's receiver is not registered until the keyguard's clock container
+     * attaches - seconds later, and not at all until the keyguard is built. A screen that asks
+     * once and keeps the answer therefore shows a DEAD module for as long as it stays open, with
+     * every value on it drawn from a default rather than from a setting, and the settings the
+     * user then appears to change go nowhere.
+     *
+     * Widening gaps and then it gives up: "the module is not installed" has to stay a state this
+     * settles into, not a poll that runs for as long as the screen is open.
+     */
+    suspend fun queryAlive(context: Context): State {
+        var state = query(context)
+        for (gap in RETRY_GAPS_MS) {
+            if (state.alive) return state
+            kotlinx.coroutines.delay(gap)
+            state = query(context)
+        }
+        return state
+    }
+
+    /** The waits between [queryAlive]'s attempts. Each attempt itself costs up to the timeout. */
+    private val RETRY_GAPS_MS = longArrayOf(1000L, 2000L, 4000L, 8000L)
 
     /**
      * The module's account of where it put the clock, as text.
@@ -418,12 +459,14 @@ object ModuleBridge {
             track = b.getString("track") ?: "",
             player = b.getString("player") ?: "",
             mcHideArt = b.getBoolean("mcart", false),
-            mcCenterText = b.getBoolean("mctext", false),
+            mcArtInLyrics = b.getBoolean("mclyricart", false),
             mcTitleTap = b.getBoolean("mctap", false),
             hideFingerprint = b.getBoolean("hidefp", false),
+            forceColon = b.getBoolean("colon", false),
             lyrics = b.getBoolean("lyrics", false),
             lyricsKeepOn = b.getBoolean("lyrickeep", false),
             lyricsHdr = b.getBoolean("lyrichdr", false),
+            sessionLyric = b.getBoolean("sessionlyric", false),
             fpAvoid = b.getInt("fpavoid", 0),
             shade = b.keySet()
                 .filter { it.startsWith("shade_") }
@@ -465,14 +508,35 @@ object ModuleBridge {
      * Every process the module is scoped to, in one go.
      *
      * Read from the scope list the module ships rather than hard-coded, so this keeps meaning
-     * "everything the module touches" if that list ever grows. For both entries today the process
-     * to restart has the same name as the package.
+     * "everything the module touches" if that list ever grows.
+     *
+     * A package's own name is not enough any more. The lock screen editor runs as
+     * `com.miui.aod:keyguardeditor`, and `pidof` matches a process name exactly - so the entry
+     * that was added for the editor restarted everything except the editor, which is the one
+     * process the hooks on it had to be re-read into. [killTree] takes the sub-processes too.
      */
     fun restartScope(context: Context): Boolean {
         val scoped = context.resources.getStringArray(R.array.xposedscope)
         var all = true
-        for (pkg in scoped) if (!kill(pkg)) all = false
+        for (pkg in scoped) if (!killTree(pkg)) all = false
         return all
+    }
+
+    /**
+     * The package's process and every `package:name` process under it.
+     *
+     * `pkill -f` matches the whole command line, which for an Android app is its process name,
+     * and the anchor stops `com.miui.aod` from also matching a package that merely ends with it.
+     * A package with nothing running is not a failure: pkill reports "no match" and the caller
+     * only wants to know that nothing refused to die.
+     */
+    private fun killTree(pkg: String): Boolean = try {
+        val p = Runtime.getRuntime().exec(
+            arrayOf("su", "-c", "pkill -f '^$pkg(\$|:)' ; true"),
+        )
+        p.waitFor() == 0
+    } catch (_: Throwable) {
+        false
     }
 
     private fun kill(process: String): Boolean = try {

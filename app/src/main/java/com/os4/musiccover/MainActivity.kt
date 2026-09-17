@@ -376,6 +376,9 @@ private fun MainScreen(
                         openLicensePage = {
                             context.startActivity(Intent(context, LicenseActivity::class.java))
                         },
+                        openCreditsPage = {
+                            context.startActivity(Intent(context, CreditsActivity::class.java))
+                        },
                         isBlurEnabled = isBlurEnabled,
                         checkUpdate = checkUpdate,
                         isCurrent = isAboutCurrent,

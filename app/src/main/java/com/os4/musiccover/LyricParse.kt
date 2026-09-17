@@ -15,6 +15,87 @@ import com.mocharealm.accompanist.lyrics.core.parser.AutoParser
  */
 object LyricParse {
 
+    /**
+     * The same thing for a source that ships its translation separately.
+     *
+     * NetEase does: the timed lyric comes back under "yrc" (or "lrc") and the translated lines
+     * under "tlyric", as a second plain LRC with no link to the first beyond its timestamps. So
+     * the two are joined here by time rather than by index - the counts do not match, because
+     * the translation has no entries for the instrumental breaks or the credits, and pairing
+     * them off in order would slide every translation one line up partway through the song.
+     */
+    @JvmStatic
+    fun parse(body: String, translation: String?): List<LyricLine> {
+        val lines = parse(body)
+        if (translation.isNullOrBlank() || lines.isEmpty()) return lines
+        val tr = lrc(translation)
+        if (tr.isEmpty()) return lines
+        val out = ArrayList<LyricLine>(lines.size)
+        for (line in lines) {
+            val text = nearest(tr, line.start)
+            out.add(if (text == null) line else withTranslation(line, text))
+        }
+        return out
+    }
+
+    /**
+     * The translated line for a line that starts at `ms`, or null if none is close enough.
+     *
+     * A window rather than an equality test: yrc and tlyric are timed independently, and the
+     * same line measured here starts at 4390ms in the word-timed copy and 4705ms in the LRC -
+     * close enough to be obviously the same line, far enough apart that matching exactly would
+     * find nothing at all. The window is wide enough for that drift and narrower than the gap
+     * between two sung lines, so the nearest entry inside it is the right one.
+     */
+    private fun nearest(entries: List<Pair<Int, String>>, ms: Int): String? {
+        var best: String? = null
+        var bestGap = TRANSLATION_WINDOW_MS
+        for ((at, text) in entries) {
+            val gap = kotlin.math.abs(at - ms)
+            // Sorted by time: once past the window there is nothing closer further on.
+            if (at > ms && gap > bestGap) break
+            if (gap <= bestGap) {
+                bestGap = gap
+                best = text
+            }
+        }
+        return best
+    }
+
+    private const val TRANSLATION_WINDOW_MS = 1500
+
+    /** Timestamped lines of a plain LRC, in time order, with the empty ones left out. */
+    private fun lrc(body: String): List<Pair<Int, String>> {
+        val out = ArrayList<Pair<Int, String>>()
+        for (raw in body.split('\n')) {
+            val m = LRC_TIME.find(raw) ?: continue
+            val text = raw.substring(m.range.last + 1).trim()
+            if (text.isEmpty()) continue
+            val min = m.groupValues[1].toIntOrNull() ?: continue
+            val sec = m.groupValues[2].toIntOrNull() ?: continue
+            val frac = m.groupValues[3]
+            // Two digits are hundredths, three are milliseconds.
+            val ms = when (frac.length) {
+                0 -> 0
+                3 -> frac.toIntOrNull() ?: 0
+                else -> (frac.toIntOrNull() ?: 0) * 10
+            }
+            out.add(Pair(min * 60000 + sec * 1000 + ms, text))
+        }
+        out.sortBy { it.first }
+        return out
+    }
+
+    private val LRC_TIME = Regex("^\\[(\\d{1,3}):(\\d{2})(?:[.:](\\d{1,3}))?]")
+
+    /** The same line carrying a translation it did not come with. */
+    private fun withTranslation(line: LyricLine, text: String): LyricLine {
+        val copy = LyricLine(line.text, text, line.start, line.end, line.opposite,
+            line.sylStart, line.sylEnd, line.charEnd)
+        copy.bg = line.bg
+        return copy
+    }
+
     @JvmStatic
     fun parse(body: String): List<LyricLine> {
         val lyrics = AutoParser().parse(body)

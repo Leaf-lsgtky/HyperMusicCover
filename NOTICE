@@ -21,3 +21,27 @@ Files carrying those changes are marked in their headers.
 This product includes miuix
 (https://github.com/miuix-kotlin-multiplatform/miuix), licensed under the
 Apache License, Version 2.0.
+
+This product includes software developed as part of AndroidLiquidGlass
+(https://github.com/Kyant0/AndroidLiquidGlass), licensed under the Apache
+License, Version 2.0.
+
+The lens, the inner shadow, the vibrancy and the combined backdrop behind the
+liquid-glass navigation bar are adapted from that project. Files carrying those
+changes are marked in their headers.
+
+This product includes software developed as part of HyperChanger
+(https://github.com/ColdP/HyperChanger), licensed under the Apache License,
+Version 2.0.
+
+The hooks that lift HyperOS's depth-effect restrictions, raise the saved lock
+screen limit, force the clock's colon and keep the soft glass through a global
+theme are adapted from that project. The file carrying those changes is marked
+in its header.
+
+This product includes accompanist-lyrics-core
+(https://github.com/6xingyv/accompanist-lyrics-core), licensed under the
+Apache License, Version 2.0.
+
+The in-app credits page lists every project this one learnt from, including the
+ones whose ideas rather than whose code are here.

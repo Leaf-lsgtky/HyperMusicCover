@@ -84,6 +84,7 @@ import top.yukonga.miuix.kmp.basic.Text as MiuixText
 @Composable
 fun AboutPageContent(
     openLicensePage: () -> Unit,
+    openCreditsPage: () -> Unit,
     isBlurEnabled: Boolean = true,
     checkUpdate: Boolean = true,
     isCurrent: () -> Boolean = { true },
@@ -147,6 +148,7 @@ fun AboutPageContent(
                 lazyListState = lazyListState,
                 scrollProgressProvider = { scrollProgress },
                 openLicensePage = openLicensePage,
+                openCreditsPage = openCreditsPage,
                 isBlurEnabled = isBlurEnabled,
                 isCurrent = isCurrent,
                 update = update,
@@ -164,6 +166,7 @@ private fun AboutContent(
     lazyListState: LazyListState,
     scrollProgressProvider: () -> Float,
     openLicensePage: () -> Unit,
+    openCreditsPage: () -> Unit,
     isBlurEnabled: Boolean,
     isCurrent: () -> Boolean,
     update: UpdateController,
@@ -397,6 +400,14 @@ private fun AboutContent(
                         ArrowPreference(
                             title = stringResource(R.string.about_dependencies),
                             onClick = openLicensePage,
+                        )
+                        // Under the licence list, because it answers the question that one
+                        // raises: the licences say what this build is legally made of, the
+                        // credits say whose work it was learnt from.
+                        ArrowPreference(
+                            title = stringResource(R.string.about_credits),
+                            summary = stringResource(R.string.about_credits_summary),
+                            onClick = openCreditsPage,
                         )
                     }
                     Spacer(modifier = Modifier.height(12.dp))
