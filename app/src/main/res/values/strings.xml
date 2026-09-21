@@ -14,20 +14,16 @@
     <string name="home_cover_off">封面锁屏已关闭</string>
     <string name="cover_section">封面</string>
     <string name="cover_bias">封面纵向位置</string>
-    <string name="cover_bias_summary">0 贴顶，0.5 居中</string>
     <string name="clock_section">时钟</string>
     <string name="cover_clock_section">封面与时钟</string>
     <string name="lyrics_section">锁屏歌词</string>
     <string name="clock_height">时钟高度</string>
-    <string name="clock_height_summary">日期和时钟一起上下移动，正数往下</string>
     <string name="clock_size">时钟大小</string>
-    <string name="clock_size_summary">相对原始时钟的大小，100% 即不缩小</string>
+    <string name="clock_aod_small">全屏息屏显示保持小时钟</string>
     <string name="clock_response">缩放动画阻尼</string>
-    <string name="clock_response_summary">默认0.38，越大阻尼感越强</string>
     <string name="clock_glass">玻璃强度</string>
     <string name="clock_glass_style_unsupported">当前时钟样式没有玻璃效果</string>
     <string name="clock_force_colon">时钟强制显示冒号</string>
-    <string name="clock_force_colon_summary">部分时钟样式默认不画时分之间的冒号</string>
     <string name="restart_menu">重启</string>
     <string name="restart_systemui">重启系统界面</string>
     <string name="restart_wallpaper">重启壁纸</string>
@@ -36,9 +32,10 @@
     <string name="tab_settings">设置</string>
     <string name="tab_about">关于</string>
     <string name="settings_interface">界面</string>
+    <string name="settings_theme">主题</string>
+    <string name="settings_theme_summary">主题模式、导航栏样式与背景模糊</string>
     <string name="settings_language">语言</string>
     <string name="settings_data">数据管理</string>
-    <string name="settings_update">更新</string>
     <string name="theme_mode">主题模式</string>
     <string name="theme_system">跟随系统</string>
     <string name="theme_light">浅色</string>
@@ -63,17 +60,13 @@
     <string name="import_settings_summary">从 JSON 文件导入设置</string>
     <string name="import_success">导入成功，即将重启应用</string>
     <string name="import_failed">导入失败，文件格式不正确</string>
-    <string name="copy_report">复制诊断信息</string>
-    <string name="copy_report_summary">时钟位置不对时，先复现一次再点这里，把内容发给开发者</string>
-    <string name="copy_report_done">已复制，粘贴发给开发者即可</string>
-    <string name="copy_report_failed">模块没有回应，确认已在 LSPosed 里启用并重启过系统界面</string>
     <string name="export_success">导出成功</string>
     <string name="export_failed">导出失败</string>
     <string name="about">关于</string>
     <string name="about_source_code">项目地址</string>
     <string name="about_dependencies">第三方许可证</string>
-    <string name="license_apache">Apache License 2.0</string>
-    <string name="license_apache_summary">查看完整协议文本</string>
+    <string name="license_agpl">GNU AGPL v3.0</string>
+    <string name="license_agpl_summary">查看完整协议文本 · 分发修改版必须同样开源</string>
     <string name="third_party_licenses_title">第三方许可证</string>
     <string name="about_credits">致谢</string>
     <string name="about_credits_summary">参考过的项目与模块</string>
@@ -110,7 +103,6 @@
     <string name="home_status_active">模块已激活</string>
     <string name="home_status_inactive">模块未激活</string>
     <string name="home_status_inactive_hint">请在 LSPosed 中启用并重启系统界面</string>
-    <string name="home_device_info">设备信息</string>
     <string name="home_device_name">设备名称</string>
     <string name="home_device_model">设备型号</string>
     <string name="home_hyperos_version">HyperOS 版本</string>
@@ -132,25 +124,33 @@
     <string name="card_section">媒体卡片</string>
     <string name="card_hide_art">隐藏封面缩略图</string>
     <string name="card_art_in_lyrics">锁屏歌词播放时显示缩略图</string>
-    <string name="card_art_in_lyrics_summary">平时仍然隐藏，只在歌词出现时把它放回来</string>
     <string name="card_title_tap">点击歌名暂停播放</string>
     <string name="lock_lyrics">锁屏歌词</string>
-    <string name="lock_lyrics_summary">封面模式下在时钟和卡片之间显示歌词，双指单击可在封面和歌词之间切换</string>
-    <string name="lyrics_provider_title_missing">请安装LyricInfo</string>
-    <string name="lyrics_provider_title_idle">LyricInfo已安装</string>
+    <string name="lock_lyrics_summary">双指单击可在封面和歌词之间切换</string>
+    <!-- The provider module, in three states rather than two. "Installed" is not the question
+         that matters - LyricInfo is an LSPosed module, and one that is installed but not enabled,
+         or enabled without the player in its scope, writes nothing while still being in the
+         package list. Each state is a title and what it means, and the same pair is used by the
+         standing row and by the notice that opens once. -->
+    <string name="lyrics_provider_title_missing">未安装 LyricInfo</string>
+    <string name="lyrics_provider_missing">显示歌词可能不准或缺失；如未安装 LyricInfo 带来的问题请勿向开发者反馈</string>
+    <string name="lyrics_provider_title_inactive">LyricInfo 已安装但未生效</string>
+    <string name="lyrics_provider_inactive">检查 LSPosed 作用域：确认模块已启用、勾选你用的播放器，然后重启系统界面</string>
+    <string name="lyrics_provider_title_ready">LyricInfo 已安装</string>
+    <string name="lyrics_provider_ready">作用域外的应用仍存在匹配失败可能</string>
     <string name="lyrics_provider_got_it">知道了</string>
-    <string name="lyrics_provider_missing">未安装则歌词获取可能不成功</string>
-    <string name="lyrics_provider_idle">请在 LSPosed 里确认模块已启用、并在作用域里勾选你用的播放器，然后重启系统界面。</string>
+    <string name="lyrics_provider_got_it_wait">知道了 (%1$d)</string>
+    <string name="lyrics_trans">显示翻译</string>
     <string name="lyrics_hdr">HDR 高光歌词（实验性功能）</string>
-    <string name="lyrics_hdr_summary">长音结尾发光时在 HDR 屏幕上以更高亮度显示</string>
     <string name="lyrics_keep_on">播放歌词时屏幕常亮</string>
-    <string name="lyrics_keep_on_summary">锁屏显示歌词且正在播放时不自动息屏，暂停后恢复</string>
     <string name="hide_fingerprint">隐藏锁屏指纹图标</string>
-    <string name="fp_avoid">通知指纹避让</string>
-    <string name="fp_avoid_summary">重启系统界面后生效</string>
-    <string name="fp_avoid_system">跟随系统</string>
-    <string name="fp_avoid_never">不避让</string>
-    <string name="fp_avoid_always">始终避让</string>
+    <!-- Sinking is the notification staying where the system put it. The module's own word for
+         the other direction is avoidance - it is the OEM's, and it is what the hook overrides -
+         so the "always sink" item is the module's fpavoid=1 and "never sink" is fpavoid=2. -->
+    <string name="fp_sink">通知下沉</string>
+    <string name="fp_sink_system">跟随系统</string>
+    <string name="fp_sink_always">始终下沉</string>
+    <string name="fp_sink_never">不下沉</string>
     <string name="get_update">获取更新</string>
     <string name="get_update_detail">检查软件更新和新功能</string>
     <string name="update_available">有可用更新：%1$s</string>
@@ -175,8 +175,6 @@
     <string name="update_percent">%1$d%%</string>
     <string name="update_downloading">正在更新</string>
     <string name="restart_scope">重启全部作用域</string>
-    <string name="check_update">检查更新</string>
-    <string name="check_update_summary">在应用启动后自动检查是否有最新版</string>
 
     <!-- The features page is a list of cards, each opening a page of its own. -->
     <string name="features_cover_title">锁屏音乐封面</string>

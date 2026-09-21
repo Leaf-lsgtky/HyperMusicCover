@@ -44,6 +44,10 @@ final class NcmLyrics {
     private static final String LYRIC =
             "https://music.163.com/api/song/lyric/v1?id=%s&cp=false&lv=0&kv=0&tv=0&rv=0&yv=0"
                     + "&ytv=0&yrv=0";
+    /** The album search, and the album itself: the route taken when the song search proves nothing. */
+    private static final String ALBUM_SEARCH =
+            "https://music.163.com/api/search/get?s=%s&type=10&limit=10";
+    private static final String ALBUM = "https://music.163.com/api/album/%s";
 
     /**
      * How far a candidate's duration may sit from the session's and still be the same recording.
@@ -56,6 +60,26 @@ final class NcmLyrics {
      * over a studio recording.
      */
     private static final long DURATION_SLACK_MS = 3000L;
+
+    /**
+     * The window for a candidate that is on the session's own album, which is a wider one.
+     *
+     * The tight window above separates two recordings of a song, and the difference it is there
+     * to catch is large: the live take it was measured against is 25 seconds from the studio one.
+     * What it also rejects, being tight, is the same recording the session is playing - because
+     * one release is pressed and mastered differently by different catalogues, and three seconds
+     * is inside that noise. Measured 2026-09-20: Apple Music's 勇敢 (张惠妹) is 239964ms and every
+     * copy of it on NetEase is longer, the album's own at 244746ms and two compilations at
+     * 243000ms, all four with the exact title and the right artist. The song played with no lyrics
+     * at all, twice over: two of the four missed the three-second window by 36 milliseconds.
+     *
+     * The album is what tells the two situations apart. A different take is a different release
+     * and does not sit on the album the session says it is playing; a different pressing of it
+     * does, and its lyrics are the same lines timed against the same performance. So a candidate
+     * whose album matches gets six seconds and a candidate whose album does not is left where it
+     * was, still bounded by the window that was measured against real takes of real songs.
+     */
+    private static final long SAME_ALBUM_SLACK_MS = 6000L;
 
     /** What the session says about the song, reduced to the four things a match can use. */
     static final class Query {
@@ -249,13 +273,34 @@ final class NcmLyrics {
             return null;
         }
         long started = android.os.SystemClock.uptimeMillis();
-        String json = get(String.format(SEARCH, URLEncoder.encode(terms, "UTF-8")));
+        String url = String.format(SEARCH, URLEncoder.encode(terms, "UTF-8"));
+        String json = get(url);
         if (json == null) {
             return null;
         }
         String id = pick(json, q);
+        // The endpoint answers with songs that have nothing to do with the query for minutes at a
+        // time: measured 2026-09-20, "勇敢 张惠妹" coming back as a page of FM-84 and then as itself
+        // again a few minutes later, same phone, same headers, same URL. A search that proves
+        // nothing is worth asking twice and no more - the miss is what gets cached, so without
+        // this a bad minute on the other side costs the song its lyrics for the whole track, and
+        // with it a song that genuinely is not there costs one extra request, once.
+        if (id == null && q.durationMs > 0 && !norm(q.title).isEmpty()) {
+            Xp.log("[MCNcm] nothing in the results for " + q + "; asking again");
+            json = get(url);
+            if (json == null) {
+                return null;
+            }
+            id = pick(json, q);
+        }
         if (id == null) {
-            Xp.log("[MCNcm] no candidate matched " + q + " (searched \"" + terms + "\")");
+            // The search answered, and what it answered with was not this song - which it also
+            // does when it is about to answer with something quite different. See byAlbum.
+            id = byAlbum(q);
+        }
+        if (id == null) {
+            Xp.log("[MCNcm] nothing matched " + q + " (searched \"" + terms
+                    + "\", and its album)");
             return null;
         }
         String lyric = get(String.format(LYRIC, id));
@@ -280,37 +325,78 @@ final class NcmLyrics {
     /** One of the response's lyric slots, or null when it is absent or empty. */
     private static String body(org.json.JSONObject o, String field) {
         org.json.JSONObject slot = o.optJSONObject(field);
-        if (slot == null) {
+        return slot == null ? null : str(slot, "lyric");
+    }
+
+    /**
+     * A string field, or null when the field is absent, null, or not a string at all.
+     *
+     * Deliberately not optString(key, ""), which is not the same question on the two platforms
+     * this code runs on. On the JVM a JSON null answers the fallback; on Android it is a sentinel
+     * object, and optString answers String.valueOf(that) - the four characters "null" - so a
+     * field that is explicitly null reads as a string that says "null".
+     *
+     * That is not a hypothetical: it is what this endpoint sends for the yrc slot of every song
+     * whose lyric is the newer rich kind, and 带你飞 is one. The "null" came back as a lyric, and
+     * being neither null nor blank it won the yrc-over-lrc choice in fetch() over the lrc beside
+     * it, which held all 24 lines of the song. What the lock screen got was a four-character body
+     * that parses to nothing, and because the answer is cached per track, the song played out
+     * with no lyrics at all. Measured against the live response on the device, not reasoned.
+     */
+    private static String str(org.json.JSONObject o, String key) {
+        Object v = o.opt(key);
+        if (!(v instanceof String)) {
             return null;
         }
-        String s = slot.optString("lyric", "");
-        return s.trim().isEmpty() ? null : s;
+        String s = ((String) v).trim();
+        return s.isEmpty() ? null : s;
     }
 
     /** Title and artist, which is what the search endpoint ranks on. */
     private static String terms(Query q) {
-        StringBuilder sb = new StringBuilder();
-        if (!q.title.isEmpty()) {
-            sb.append(q.title);
+        return joined(q.title, firstArtist(q.artist));
+    }
+
+    /** The album's name and its artist, which is what the album search ranks on. */
+    private static String albumTerms(Query q) {
+        return joined(q.album, firstArtist(q.artist));
+    }
+
+    /** Two search terms, either of which may be missing, in the one order the endpoint wants. */
+    private static String joined(String a, String b) {
+        if (a == null || a.isEmpty()) {
+            return b == null ? "" : b;
         }
-        if (!q.artist.isEmpty()) {
-            // Only the first credited name: "LAUV/Troye Sivan" as a whole matches nothing, and
-            // the search ranks on the primary artist anyway.
-            String first = q.artist;
-            int slash = first.indexOf('/');
-            if (slash > 0) {
-                first = first.substring(0, slash);
-            }
-            if (sb.length() > 0) {
-                sb.append(' ');
-            }
-            sb.append(first.trim());
-        }
-        return sb.toString().trim();
+        return b == null || b.isEmpty() ? a : a + ' ' + b;
     }
 
     /**
-     * Which of the search results is this recording - or none of them.
+     * The first credited name out of a session's artist string.
+     *
+     * Only the first, for a search: "LAUV/Troye Sivan" as a whole matches nothing, and the search
+     * ranks on the primary artist anyway. Whether a result is by this artist is a different
+     * question and is asked of the whole string - see byArtist.
+     */
+    private static String firstArtist(String artist) {
+        int slash = artist.indexOf('/');
+        return (slash > 0 ? artist.substring(0, slash) : artist).trim();
+    }
+
+    /** The songs out of a search response, matched - or null when the response holds none. */
+    private static String pick(String json, Query q) {
+        try {
+            return choose(new org.json.JSONObject(json).getJSONObject("result")
+                    .getJSONArray("songs"), q);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Which of these songs is the session's recording - or none of them.
+     *
+     * Asked of both ways in: the song search's results, and an album's own track list, which is
+     * the same question put to a shorter and much more certain list.
      *
      * The title has to match. This started out the other way round, scoring duration alone on
      * the argument that titles differ in punctuation and capitalisation while a duration is
@@ -321,30 +407,30 @@ final class NcmLyrics {
      * seconds apart, but two tracks on one album routinely are, and the album name cannot
      * separate them because it is the same album.
      *
-     * So the order is: title first, then album, then duration as the tie-break. Titles are
-     * compared with everything that varies between catalogues removed - case, spacing,
+     * So the order is: title first, then artist, then album, then duration as the tie-break.
+     * Titles are compared with everything that varies between catalogues removed - case, spacing,
      * punctuation, brackets - and an exact match outranks one string containing the other, which
      * is what keeps the studio take ahead of "...（翻自 Lauv）" and "..._Purplepick" when all
      * three are the same length.
      *
      * Duration stays a hard gate rather than a score: outside the window a candidate is not
      * considered at all, whatever its title says. That is what separates a live take from its
-     * studio version - same title, same artists, 25 seconds apart.
+     * studio version - same title, same artists, 25 seconds apart. There are two windows rather
+     * than one and the album picks between them, because the same release is pressed and mastered
+     * differently by different catalogues; see SAME_ALBUM_SLACK_MS for the measurement.
      *
-     * Nothing matching is a real answer. The caller shows no lyrics, which is what it did
-     * before this source existed.
+     * Nothing matching is a real answer, and a better one than the wrong song: the caller shows
+     * no lyrics, which is what it did before this source existed, and byAlbum gets a second
+     * chance at it.
      */
-    private static String pick(String json, Query q) {
+    private static String choose(org.json.JSONArray songs, Query q) {
+        if (songs == null) {
+            return null;
+        }
         if (q.durationMs <= 0) {
             // Without a duration there is nothing here that can prove a match, and the
             // first search result is a guess, not an answer.
             Xp.log("[MCNcm] session publishes no duration; not guessing");
-            return null;
-        }
-        org.json.JSONArray songs;
-        try {
-            songs = new org.json.JSONObject(json).getJSONObject("result").getJSONArray("songs");
-        } catch (Throwable t) {
             return null;
         }
         String wanted = norm(q.title);
@@ -364,17 +450,30 @@ final class NcmLyrics {
             if (dur <= 0) {
                 continue;
             }
-            long diff = Math.abs(dur - q.durationMs);
-            if (diff > DURATION_SLACK_MS) {
+            // A result with no name is not a candidate: scored, "null" would only ever have been
+            // a title that matches nothing. See str() for why it has to be asked this way.
+            String name = str(s, "name");
+            if (name == null) {
                 continue;
             }
-            int score = titleScore(wanted, norm(s.optString("name", "")));
+            int score = nameScore(wanted, norm(name));
             if (score == 0) {
                 continue;
             }
+            if (!byArtist(q.artist, s)) {
+                continue;
+            }
             org.json.JSONObject al = s.optJSONObject("album");
-            if (!q.album.isEmpty() && al != null
-                    && norm(q.album).equals(norm(al.optString("name", "")))) {
+            String albumName = al == null ? null : str(al, "name");
+            boolean sameAlbum = albumName != null && !q.album.isEmpty()
+                    && norm(q.album).equals(norm(albumName));
+            // Which window applies depends on the album, so the album has to be read before the
+            // window rather than after it as the tie-break it used to be. See SAME_ALBUM_SLACK_MS.
+            long diff = Math.abs(dur - q.durationMs);
+            if (diff > (sameAlbum ? SAME_ALBUM_SLACK_MS : DURATION_SLACK_MS)) {
+                continue;
+            }
+            if (sameAlbum) {
                 score++;
             }
             if (best == null || score > bestScore || (score == bestScore && diff < bestDiff)) {
@@ -390,8 +489,91 @@ final class NcmLyrics {
         return best;
     }
 
-    /** 4 for the same title, 2 when one contains the other, 0 when they are unrelated. */
-    private static int titleScore(String wanted, String got) {
+    /**
+     * The same song, looked for inside the album the session names.
+     *
+     * The search endpoint does not always answer with what it would have answered a minute
+     * earlier, and nothing in the response says which kind of answer it is. Measured 2026-09-20,
+     * playing 田馥甄's 余波荡漾: the search came back as that title by other artists and as that
+     * artist's other songs, with the song itself missing, while the album it is on answered for it
+     * 44 milliseconds from the session's duration and carries 27 lines plus a word-timed copy of
+     * them. The same query answered properly, three times running, a few minutes later.
+     *
+     * An album has nothing to rank, which is why it is the route taken here: ask for one by name
+     * and artist and the answer is its track list, every track with its own duration. Two
+     * requests, spent on the path where the answer so far is that there is nothing.
+     */
+    private static String byAlbum(Query q) {
+        if (q.album.isEmpty() || q.title.isEmpty() || q.durationMs <= 0) {
+            // Nothing to look an album up by, so this is not a second chance at anything.
+            return null;
+        }
+        try {
+            String json = get(String.format(ALBUM_SEARCH,
+                    URLEncoder.encode(albumTerms(q), "UTF-8")));
+            if (json == null) {
+                return null;
+            }
+            String album = albumOf(json, q);
+            if (album == null) {
+                Xp.log("[MCNcm] no album of " + q.artist + "'s called " + q.album);
+                return null;
+            }
+            json = get(String.format(ALBUM, album));
+            if (json == null) {
+                return null;
+            }
+            org.json.JSONObject found = new org.json.JSONObject(json).optJSONObject("album");
+            String id = found == null ? null : choose(found.optJSONArray("songs"), q);
+            Xp.log("[MCNcm] album " + album + " (" + q.album + ") -> " + id);
+            return id;
+        } catch (Throwable t) {
+            Xp.log("[MCNcm] album lookup failed: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * Which of the album search's results is the album the session names - or none of them.
+     *
+     * Its name first and its artist second, the way choose() asks it of a song and for the same
+     * reason: more than one artist has an album called 日常, and the session has said whose.
+     */
+    private static String albumOf(String json, Query q) {
+        org.json.JSONArray albums;
+        try {
+            albums = new org.json.JSONObject(json).getJSONObject("result").getJSONArray("albums");
+        } catch (Throwable t) {
+            return null;
+        }
+        String wanted = norm(q.album);
+        String best = null;
+        int bestScore = 0;
+        for (int i = 0; i < albums.length(); i++) {
+            org.json.JSONObject a = albums.optJSONObject(i);
+            if (a == null) {
+                continue;
+            }
+            String name = str(a, "name");
+            if (name == null || !byArtist(q.artist, a)) {
+                continue;
+            }
+            int score = nameScore(wanted, norm(name));
+            if (score > bestScore) {
+                best = String.valueOf(a.optLong("id", 0L));
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 4 when the names are the same, 2 when one contains the other, 0 when they are unrelated.
+     *
+     * Asked of titles and of album names alike, which are the same problem: one name typed by two
+     * catalogues.
+     */
+    private static int nameScore(String wanted, String got) {
         if (got.isEmpty()) {
             return 0;
         }
@@ -402,17 +584,58 @@ final class NcmLyrics {
     }
 
     /**
+     * Whether this result is by the artist the session says it is.
+     *
+     * The search ranks on title and artist together, but it returns other people's songs under the
+     * same title, and until this existed an exact title with a duration inside the window was
+     * enough to be chosen whatever name was on it. Measured 2026-09-20, playing 田馥甄's 余波荡漾:
+     * the search answered with a page of that title by other artists and a page of that artist's
+     * other songs, and not with the song, which is on the album it is on. pick() took 粟丹sudan's
+     * piano version - exact title, 1673ms from the session. That one happened to carry no lyric,
+     * so the screen stayed empty; the copy 158ms from the session was a cover, and it would have
+     * been shown had the ranking put it first. Another singer's name is not a near miss.
+     *
+     * Compared with the latitude the titles get - everything that varies between catalogues
+     * removed, and either name containing the other - which is what lets a session's
+     * "LAUV/Troye Sivan" match a catalogue crediting only one of them.
+     *
+     * With nothing on either side to compare, the answer is yes: this can rule a candidate out,
+     * it cannot find one, and a player publishing no artist should not lose its lyrics to it.
+     */
+    private static boolean byArtist(String wanted, org.json.JSONObject s) {
+        String want = norm(wanted);
+        org.json.JSONArray ar = s.optJSONArray("artists");
+        if (want.isEmpty() || ar == null || ar.length() == 0) {
+            return true;
+        }
+        for (int i = 0; i < ar.length(); i++) {
+            org.json.JSONObject a = ar.optJSONObject(i);
+            if (a == null) {
+                continue;
+            }
+            String got = norm(str(a, "name"));
+            if (!got.isEmpty() && (got.contains(want) || want.contains(got))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * A title with everything that varies between catalogues taken out.
      *
      * Case, spaces, punctuation and brackets all differ for the same song depending on who typed
      * it in - "i'm so tired... (Stripped - Live in LA)" against "i'm so tired...(Stripped - Live
      * in LA)" is the same recording with one space missing. What is left is letters and digits,
      * in order, which is enough to tell two titles apart and not enough to be upset by a comma.
+     *
+     * The script is the other thing that varies, and it is folded first - see folded().
      */
     private static String norm(String s) {
         if (s == null) {
             return "";
         }
+        s = folded(s);
         StringBuilder sb = new StringBuilder(s.length());
         for (int i = 0; i < s.length(); i++) {
             char ch = s.charAt(i);
@@ -421,6 +644,49 @@ final class NcmLyrics {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * The same name written in simplified Chinese, because the two catalogues do not agree on the
+     * script and neither of them says so.
+     *
+     * Measured 2026-09-20, playing 林忆莲's 是你治癒了我的孤单: Apple Music publishes the traditional
+     * 癒 and NetEase the simplified 愈, and the one candidate that was the right song - 681ms from
+     * the session's duration, right artist - differed from the session's title by that character
+     * alone. Nothing else about them disagreed, norm() read them as two different songs, and the
+     * song played with no lyrics while its lyrics sat one row down the same response. The split
+     * runs through the names of people too (林憶蓮 against 林忆莲), which is why the whole name is
+     * folded rather than the title.
+     *
+     * ICU's own transform, which this device has and which does exactly this. If a build ever
+     * lacks it the name is compared as it is: that is the comparison that was here before, and it
+     * is a better failure than every song with a character variant losing its lyrics.
+     */
+    private static String folded(String s) {
+        android.icu.text.Transliterator t = TRANSLIT;
+        if (t == null) {
+            return s;
+        }
+        try {
+            // Not thread-safe, and the lookups arrive on more than one thread.
+            synchronized (t) {
+                return t.transliterate(s);
+            }
+        } catch (Throwable e) {
+            return s;
+        }
+    }
+
+    /** Built once: getInstance parses the rules, and norm() runs a dozen times per candidate. */
+    private static final android.icu.text.Transliterator TRANSLIT = transliterator();
+
+    private static android.icu.text.Transliterator transliterator() {
+        try {
+            return android.icu.text.Transliterator.getInstance("Traditional-Simplified");
+        } catch (Throwable t) {
+            Xp.log("[MCNcm] no traditional-to-simplified transform here: " + t);
+            return null;
+        }
     }
 
     /**

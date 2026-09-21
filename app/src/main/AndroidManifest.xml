@@ -123,6 +123,16 @@
             android:label="@string/features_shade_title"
             android:theme="@style/Theme.HyperMusicCover" />
 
+        <!-- The theme settings, opened from the settings page's interface section. Declared like
+             every other sub-screen above: an Activity, so the platform supplies the transition
+             and the back handling - gesture, button and predictive back - rather than the
+             settings page imitating all three. -->
+        <activity
+            android:name=".ThemeActivity"
+            android:exported="false"
+            android:label="@string/settings_theme"
+            android:theme="@style/Theme.HyperMusicCover" />
+
         <!-- The payment codes, opened from the home page's donate card. -->
         <activity
             android:name=".DonateActivity"

@@ -1,6 +1,10 @@
 /*
  * Adapted from KernelSU (https://github.com/tiann/KernelSU),
- * licensed under the Apache License, Version 2.0.
+ * licensed under the GNU General Public License, version 3.
+ *
+ * Distributed here as part of an AGPL-3.0 work: GPLv3 section 13 and AGPLv3
+ * section 13 permit the combination, and the combined work as a whole is
+ * licensed under the AGPL-3.0. This file is not relicensed. See NOTICE.
  */
 package com.os4.musiccover.ui.component
 

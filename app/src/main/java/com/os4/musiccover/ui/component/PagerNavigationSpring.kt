@@ -1,6 +1,8 @@
 /*
- * Adapted from KernelSU (https://github.com/tiann/KernelSU),
- * licensed under the Apache License, Version 2.0.
+ * Adapted from miuix (https://github.com/compose-miuix-ui/miuix), whose
+ * PagerNavigationSpringSpec this is - see PagerGestureUtils.kt.
+ * Licensed under the Apache License, Version 2.0.
+ * Copyright 2025, compose-miuix-ui contributors
  */
 package com.os4.musiccover.ui.component
 

@@ -118,6 +118,35 @@ public class WallpaperProbe {
      * leave the cover sharp for the rest of the song, both sides believing it was blurred.
      */
     private static volatile boolean sLyricBlurWant;
+    /**
+     * When the newest blur decision this process has been given was made, on the clock both
+     * processes share. See LockLyrics.putBlurOn.
+     *
+     * The answer and the cover travel in two broadcasts sent from two different threads over
+     * there - the cover is composed and sent on the worker, the answer is decided on the main
+     * thread - so the one that arrives last is not the one that was decided last, and the cover
+     * is the slow half. Tapping the artwork out of cover mode and quickly back in is exactly
+     * that: the push, built before the tap, carries the answer from before it and reaches here
+     * after the lyric switch has said the opposite. Taken at face value it undoes the switch, and
+     * since both sides then believe they agree nothing re-sends it - a song playing out sharp
+     * under its lyrics.
+     *
+     * Time rather than a count, because a count is only comparable within one SystemUI process:
+     * a restarted SystemUI starts over at one, and every decision it makes would look older than
+     * what this process already holds. 0 means the message carried no stamp at all - an older
+     * SystemUI, which sends the answer on its own.
+     */
+    private static volatile long sBlurSeq;
+    /**
+     * Every message that could carry a blur decision, and every one that carried a cover.
+     *
+     * The completion of the fade out of cover mode clears the art and the blur, and it runs a
+     * whole crossfade after the message that started it. A tap back in lands inside that window,
+     * so the completion has to be able to tell whether the look it belongs to is still the one
+     * being asked for. Counted separately because the two halves are cleared for the same reason
+     * but not by the same thing: a lyric switch arriving mid-fade owns the blur and not the art.
+     */
+    private static volatile int sMsgSeq, sArtSeq;
     private static Bitmap sFrosted, sFrostedOf;
     private static Bitmap sFrosted2, sFrostedOf2;
 
@@ -2008,9 +2037,16 @@ public class WallpaperProbe {
                         // Whatever arrives now is newer than a composition still in progress,
                         // which would otherwise land after it and put an older cover back.
                         if (!i.hasExtra("src")) sSrcSeq++;
+                        sArtSeq++;
+                        sMsgSeq++;
                         // What the lyrics want of THIS cover. See applyArt(), which is where it
-                        // takes effect; older builds of SystemUI send no such extra.
-                        if (i.hasExtra("lyricblur")) {
+                        // takes effect; older builds of SystemUI send no such extra, and an older
+                        // SystemUI sends the answer without its place in line.
+                        boolean blurMine = true;
+                        if (i.hasExtra("blurseq")) {
+                            blurMine = takeBlurDecision(i.getLongExtra("blurseq", 0L),
+                                    i.getBooleanExtra("lyricblur", false), "cover");
+                        } else if (i.hasExtra("lyricblur")) {
                             sLyricBlurWant = i.getBooleanExtra("lyricblur", false);
                         }
                         if (i.hasExtra("tsent")) {
@@ -2043,17 +2079,37 @@ public class WallpaperProbe {
                             }
                             Bitmap from = fittedArt();
                             Bitmap to = sOrig;
+                            // The look this fade belongs to, read before it starts. Anything
+                            // arriving while it runs - a tap back into cover mode, the next
+                            // track, a lyric switch - describes the look coming back, and this
+                            // completion must not touch it: it clears the art that one has
+                            // already set and the blur it has already asked for. Measured as the
+                            // cover coming back sharp under its lyrics after the artwork was
+                            // tapped out and quickly back in, and staying sharp for the song.
+                            final int msgSeq = sMsgSeq;
+                            final int artSeq = sArtSeq;
+                            final boolean blurStillMine = blurMine;
                             if (fade && from != null && to != null) {
                                 startFade(from, to, new Runnable() {
                                     @Override
                                     public void run() {
+                                        if (blurStillMine && msgSeq == sMsgSeq) {
+                                            sLyricBlur = false;
+                                            sLyricBlurWant = false;
+                                            dropFrosted();
+                                        } else {
+                                            Xp.log(TAG + "the lyrics were switched while the cover"
+                                                    + " was fading out, leaving their blur alone");
+                                        }
+                                        if (artSeq != sArtSeq) {
+                                            Xp.log(TAG + "a cover arrived while the last one was"
+                                                    + " fading out, leaving the art to it");
+                                            return;
+                                        }
                                         sCurrentArtChecksum = 0;
                                         sArt = null;
                                         sFitted = null;
                                         sFittedOf = null;
-                                        sLyricBlur = false;
-                                        sLyricBlurWant = false;
-                                        dropFrosted();
                                         new File(cc.getFilesDir(), ART_FILE).delete();
                                         new File(cc.getFilesDir(), SRC_FILE).delete();
                                         Xp.log(TAG + "art cleared");
@@ -2063,9 +2119,11 @@ public class WallpaperProbe {
                             }
                             sCurrentArtChecksum = 0;
                             sArt = null;
-                            sLyricBlur = false;
-                            sLyricBlurWant = false;
-                            dropFrosted();
+                            if (blurStillMine) {
+                                sLyricBlur = false;
+                                sLyricBlurWant = false;
+                                dropFrosted();
+                            }
                             new File(c.getFilesDir(), ART_FILE).delete();
                             new File(c.getFilesDir(), SRC_FILE).delete();
                             Xp.log(TAG + "art cleared");
@@ -2130,7 +2188,12 @@ public class WallpaperProbe {
                             reloadDesktopTexture();
                         }
                     } else if ("lyricblur".equals(op)) {
-                        setLyricBlur(i.getBooleanExtra("on", false));
+                        final boolean on = i.getBooleanExtra("on", false);
+                        sMsgSeq++;
+                        if (!i.hasExtra("blurseq")
+                                || takeBlurDecision(i.getLongExtra("blurseq", 0L), on, "lyrics")) {
+                            setLyricBlur(on);
+                        }
                     } else if ("reload".equals(op)) {
                         reloadTexture();
                     } else if ("fadems".equals(op)) {
@@ -2250,6 +2313,8 @@ public class WallpaperProbe {
         // `want` is what SystemUI last asked for, `on` is what the cover is actually drawn with.
         sb.append("\nlyric blur: ").append(sLyricBlur ? "on" : "off")
                 .append(", asked for: ").append(sLyricBlurWant ? "on" : "off")
+                .append(" (decided at ").append(sBlurSeq).append("ms, ")
+                .append(sMsgSeq).append(" messages since)")
                 .append(sLyricBlur == sLyricBlurWant ? "" : "   <- OUT OF STEP");
         sb.append("\ncrossfade after that: ").append(sTrackFadeMs)
                 .append("ms on a track change, ").append(sFadeMs)
@@ -2266,6 +2331,34 @@ public class WallpaperProbe {
     private static void seg(StringBuilder sb, String name, long ms) {
         if (ms <= 0L) return;
         sb.append("\n  ").append(name).append(": ").append(ms).append("ms");
+    }
+
+    /**
+     * Takes a blur answer from SystemUI, unless a later one has already been taken. Answers
+     * whether this one was the later.
+     *
+     * The place in line rides with the answer because the two messages that can carry one are
+     * built and sent from different threads over there: the cover push is composed and sent on
+     * the worker while the answer itself is decided on the main thread. The one that arrives last
+     * is therefore not the one that was decided last, and the cover is the slow half - it is read
+     * first and sent after - so it is the one that arrives holding the stale answer. Taken at
+     * face value that answer undoes the switch that came after it, and nothing re-sends, which is
+     * a song playing out sharp under its lyrics.
+     */
+    private static boolean takeBlurDecision(long seq, boolean on, String via) {
+        if (seq != 0L && seq < sBlurSeq) {
+            Xp.log(TAG + "the " + via + " carried an answer made before the one in hand ("
+                    + seq + " against " + sBlurSeq + "), leaving the cover "
+                    + (sLyricBlurWant ? "frosted" : "sharp"));
+            return false;
+        }
+        if (seq > sBlurSeq) sBlurSeq = seq;
+        if (sLyricBlurWant != on) {
+            sLyricBlurWant = on;
+            Xp.log(TAG + "the " + via + " asks for a " + (on ? "frosted" : "sharp")
+                    + " cover (decided at " + seq + ")");
+        }
+        return true;
     }
 
     /**

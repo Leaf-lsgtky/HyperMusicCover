@@ -63,7 +63,6 @@ import top.yukonga.miuix.kmp.basic.ListPopupColumn
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.Scaffold
-import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.overlay.OverlayListPopup
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -264,13 +263,13 @@ fun HomePageView(
             }
         }
 
+        // No heading over this one. The five rows say what they are - a heading reading
+        // "device information" over a list of device facts only repeated them - and the gap it
+        // used to hold is now the card's own, so the card sits exactly where it always did.
         item {
-            SmallTitle(
-                text = stringResource(R.string.home_device_info),
-                modifier = Modifier.padding(top = 12.dp)
-            )
             Card(
                 modifier = Modifier
+                    .padding(top = 12.dp)
                     .padding(horizontal = 12.dp)
                     .padding(bottom = 12.dp)
             ) {

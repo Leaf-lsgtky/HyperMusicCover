@@ -152,15 +152,14 @@ class UpdateController internal constructor(internal val states: UpdateStates) {
  * and the install outlives the composition that started it.
  */
 @Composable
-fun rememberUpdateController(isCurrent: () -> Boolean, checkUpdate: Boolean): UpdateController {
+fun rememberUpdateController(isCurrent: () -> Boolean): UpdateController {
     val context = LocalContext.current
     // LocalResources, not context.getString: the latter is not configuration-aware, and lint
     // fails the build on it (LocalContextGetResourceValueCall).
     val resources = LocalResources.current
-    // Two separate questions, asked together: may this build update itself at all (not a fork,
-    // not a debug build), and does the user want it to. Flipping the setting re-runs every effect
-    // below, which is what makes the switch on the Settings page take effect immediately.
-    val allowed = remember(checkUpdate) { checkUpdate && UpdateApi.enabled(context) }
+    // One question only: may this build update itself at all (not a fork, not a debug build).
+    // There is no switch for it - checking for updates is not something this app turns off.
+    val allowed = remember { UpdateApi.enabled(context) }
     val states = remember {
         UpdateStates().apply {
             update = UpdateCheck.result

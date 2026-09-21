@@ -85,6 +85,22 @@ class MainActivity : ComponentActivity() {
     private var uiReady = false
 
     /**
+     * Bumped every time this activity comes back to the front, and read as a `remember` key in
+     * `setContent` below.
+     *
+     * The theme screen is an activity of its own - the house pattern for a sub-screen - so it
+     * saves what it changes while this one is stopped, and the settings this page holds were read
+     * in `onCreate`. Coming home from a theme change without re-reading them would leave the app
+     * drawn in the theme it had on the way out, until the next cold start.
+     */
+    private var settingsEpoch by mutableStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        settingsEpoch++
+    }
+
+    /**
      * Deliberately not applied the moment the theme setting changes: it is a configuration
      * change, so the activity is recreated and the switch visibly jumps. Doing it once the app
      * is off screen gets the same result - the splash is right on the next launch - with nobody
@@ -118,19 +134,22 @@ class MainActivity : ComponentActivity() {
         holdSplashUntilContentIsReady(splashIsShowing = savedInstanceState == null)
 
         setContent {
-            var themeMode by remember {
+            // Re-read on the way back from the theme screen, which saves its own changes while
+            // this activity is stopped. Keyed on the epoch so the values follow it, and nothing
+            // else does - the pager keeps its page and every other page keeps its state.
+            val settings = remember(settingsEpoch) { AppSettings.load(this@MainActivity) }
+            var themeMode by remember(settingsEpoch) {
                 mutableStateOf(
                     try {
-                        ColorSchemeMode.valueOf(savedSettings.themeMode)
+                        ColorSchemeMode.valueOf(settings.themeMode)
                     } catch (_: Exception) {
                         ColorSchemeMode.System
                     }
                 )
             }
-            var isFloatingNavbar by remember { mutableStateOf(savedSettings.isFloatingNavbar) }
-            var isLiquidGlass by remember { mutableStateOf(savedSettings.isLiquidGlass) }
-            var isBlurEnabled by remember { mutableStateOf(savedSettings.isBlurEnabled) }
-            var checkUpdate by remember { mutableStateOf(savedSettings.checkUpdate) }
+            var isFloatingNavbar by remember(settingsEpoch) { mutableStateOf(settings.isFloatingNavbar) }
+            var isLiquidGlass by remember(settingsEpoch) { mutableStateOf(settings.isLiquidGlass) }
+            var isBlurEnabled by remember(settingsEpoch) { mutableStateOf(settings.isBlurEnabled) }
 
             fun persistState() {
                 AppSettings.save(
@@ -140,7 +159,6 @@ class MainActivity : ComponentActivity() {
                         isFloatingNavbar = isFloatingNavbar,
                         isLiquidGlass = isLiquidGlass,
                         isBlurEnabled = isBlurEnabled,
-                        checkUpdate = checkUpdate,
                         language = LocaleHelper.getSavedLanguage(this@MainActivity).code,
                     )
                 )
@@ -156,22 +174,20 @@ class MainActivity : ComponentActivity() {
                     uiReady = true
                 }
                 // The update check belongs to the app starting, not to the About page being
-                // opened - the setting says so, and it is the one moment the answer is worth
-                // having before anyone goes looking for it. The About page only reads this.
+                // opened - it is the one moment the answer is worth having before anyone goes
+                // looking for it. The About page only reads this.
                 LaunchedEffect(Unit) {
-                    if (checkUpdate) UpdateCheck.refresh(this@MainActivity)
+                    UpdateCheck.refresh(this@MainActivity)
                 }
                 MainScreen(
                     themeMode = themeMode,
                     isFloatingNavbar = isFloatingNavbar,
                     isLiquidGlass = isLiquidGlass,
                     isBlurEnabled = isBlurEnabled,
-                    checkUpdate = checkUpdate,
                     onThemeModeChange = { themeMode = it; persistState() },
                     onFloatingNavbarChange = { isFloatingNavbar = it; persistState() },
                     onLiquidGlassChange = { isLiquidGlass = it; persistState() },
                     onBlurEnabledChange = { isBlurEnabled = it; persistState() },
-                    onCheckUpdateChange = { checkUpdate = it; persistState() },
                 )
             }
         }
@@ -221,12 +237,10 @@ private fun MainScreen(
     isFloatingNavbar: Boolean,
     isLiquidGlass: Boolean,
     isBlurEnabled: Boolean,
-    checkUpdate: Boolean,
     onThemeModeChange: (ColorSchemeMode) -> Unit,
     onFloatingNavbarChange: (Boolean) -> Unit,
     onLiquidGlassChange: (Boolean) -> Unit,
     onBlurEnabledChange: (Boolean) -> Unit,
-    onCheckUpdateChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val pagerState = rememberPagerState(pageCount = { 4 })
@@ -359,16 +373,7 @@ private fun MainScreen(
                     )
 
                     2 -> SettingsPageView(
-                        currentMode = themeMode,
-                        onModeChange = onThemeModeChange,
-                        isFloatingNavbar = isFloatingNavbar,
-                        onFloatingNavbarChange = onFloatingNavbarChange,
-                        isLiquidGlass = isLiquidGlass,
-                        onLiquidGlassChange = onLiquidGlassChange,
                         isBlurEnabled = isBlurEnabled,
-                        onBlurEnabledChange = onBlurEnabledChange,
-                        checkUpdate = checkUpdate,
-                        onCheckUpdateChange = onCheckUpdateChange,
                         extraBottomPadding = navBarHeight,
                     )
 
@@ -380,7 +385,6 @@ private fun MainScreen(
                             context.startActivity(Intent(context, CreditsActivity::class.java))
                         },
                         isBlurEnabled = isBlurEnabled,
-                        checkUpdate = checkUpdate,
                         isCurrent = isAboutCurrent,
                     )
                 }

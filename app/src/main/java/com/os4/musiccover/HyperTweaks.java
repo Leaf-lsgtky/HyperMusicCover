@@ -39,6 +39,15 @@ final class HyperTweaks {
     static volatile boolean sForceColon;
 
     /**
+     * The lock screen media card's progress bar, lit the way the island's is.
+     *
+     * On by default. Switched off it takes effect on the next card the OEM builds, not on the one
+     * on screen: the mode is read in the widget's constructor and the shader it decides on is a
+     * final field, so a bar already running it cannot be talked back out of it.
+     */
+    static volatile boolean sBarGlow = true;
+
+    /**
      * What each hook did, in the order they were tried.
      *
      * Not a nicety. Module INFO logs are not readable on this device - LSPosed keeps only
@@ -62,6 +71,7 @@ final class HyperTweaks {
     /** One line per hook, for `op tweaks`. */
     static String describe() {
         StringBuilder sb = new StringBuilder("colon=").append(sForceColon ? "on" : "off");
+        sb.append(System.lineSeparator()).append("barglow=").append(sBarGlow ? "on" : "off");
         synchronized (STATUS) {
             if (STATUS.isEmpty()) {
                 sb.append(System.lineSeparator())
@@ -126,6 +136,173 @@ final class HyperTweaks {
         // plugin's loader to be built.
         if (!sPluginHooked) watchForPlugin();
         clockColon(cl, "systemui", () -> sForceColon);
+        mediaBarGlow(cl, () -> sBarGlow);
+    }
+
+    // The lock screen media card's progress bar, miuix's HyperProgressSeekBar. The island's media
+    // card uses the same widget and leaves progressBarMode unset, so the widget asks the device
+    // what it can do - DeviceUtils.getDeviceLevel() - and on this phone answers 2, the mode that
+    // draws the bar with an AGSL runtime shader, glow and all. The lock screen's card names
+    // Widget.HyperProgressSeekBar.Normal instead, and that style pins progressBarMode to 0: the
+    // flat drawing, no shader, no glow. Nothing about the two cards' colours differs - both
+    // styles carry the same drawable and the same alphas - so the mode is the whole of it.
+    private static final String CLS_MEDIA_BAR = "miuix.miuixbasewidget.widget.HyperProgressSeekBar";
+
+    /** The shader the widget loads at device level 2. Level 1 has a lighter one of its own. */
+    private static final String SHADER_ENTRY = "music_player_tracker";
+
+    /**
+     * Lights the card's bar on the way in, so the view the OEM is about to bind is already the one
+     * we want: progress, drag and the seek listener are all the OEM's, and none of them is ours to
+     * re-attach.
+     *
+     * A constructor hook rather than anything later because the mode is read in the constructor
+     * and the shader it picks is a final field, so an instance built flat cannot be upgraded into
+     * the shader path by reflection - only its two fields can be filled in by hand, which is what
+     * applyBarGlow does for the bar already on screen when the probe flips the switch.
+     */
+    private static void mediaBarGlow(ClassLoader cl, java.util.function.BooleanSupplier wanted) {
+        String what = "media-bar-glow";
+        try {
+            Class<?> cls = Xp.findClass(CLS_MEDIA_BAR, cl);
+            Xp.hookAllConstructors(cls, chain -> {
+                Object result = chain.proceed();
+                if (wanted.getAsBoolean()) {
+                    try {
+                        applyBarGlow((android.view.View) chain.getThisObject());
+                    } catch (Throwable t) {
+                        // A bar left flat is a bar, not a broken lock screen.
+                        Xp.log(TAG + "media bar glow skipped: " + t);
+                    }
+                }
+                return result;
+            });
+            // A touch on a level 2 bar runs through the level 2 branch of onTouchEvent, and that
+            // branch drives mHeadAlphaAnimator - the blob of light at the fill's edge, which
+            // swells when the bar is taken hold of and springs back on release. A bar built at
+            // level 0 has no such field at all, so that branch is a NullPointerException in
+            // SystemUI's own thread; buildHeadAnimator below is the attempt to give it one.
+            //
+            // When that attempt did not take, the drag runs as level 0 instead - the path this
+            // instance was built and fully set up for, at the cost of the press feedback, which
+            // the level 0 path spends on a progress alpha the shader never reads. Restored in a
+            // finally, because a touch that throws must not leave the bar drawing the flat way
+            // for good.
+            Xp.hookAll(cls, "onTouchEvent", chain -> {
+                Object self = chain.getThisObject();
+                if (!sGlowBars.containsKey(self) || hasHeadAnimator(self)) return chain.proceed();
+                Xp.setObjectField(self, "mDeviceLevel", 0);
+                try {
+                    return chain.proceed();
+                } finally {
+                    Xp.setObjectField(self, "mDeviceLevel", 2);
+                }
+            });
+            ok(what);
+        } catch (Throwable t) {
+            failed(what, t);
+        }
+    }
+
+    /** The bars this module has put into the shader mode, for the touch guard above. */
+    private static final java.util.Map<android.view.View, Boolean> sGlowBars =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<android.view.View, Boolean>());
+
+    /**
+     * Whether a touch on this bar can run the level 2 path: it animates the head through this
+     * pair, so both halves have to be there. Answered per touch rather than remembered, because
+     * the pair is what the touch path dereferences and nothing else is worth trusting.
+     */
+    private static boolean hasHeadAnimator(Object bar) {
+        try {
+            Object target = Xp.getObjectField(bar, "mHeadAlphaAnimator");
+            return target != null && Xp.getObjectField(target, "mFolmeImpl") != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * The head animator a bar built at level 1 or 2 is given in its constructor, built here for a
+     * bar that was built flat.
+     *
+     * ProgressAnimTarget is an inner class of the widget, so it needs the bar to construct, and
+     * Folme hands it the implementation the touch path animates through the FolmeObject interface
+     * - itself the reason this is not simply a field write.
+     *
+     * Best effort by design. Its absence costs the press feedback and nothing else, because the
+     * touch guard above stands aside only when this is known to have worked, and a failure here
+     * leaves the drag on the level 0 path rather than on a null dereference.
+     */
+    private static void buildHeadAnimator(android.view.View bar) {
+        try {
+            ClassLoader cl = bar.getClass().getClassLoader();
+            Class<?> targetCls = Xp.findClass(
+                    "miuix.miuixbasewidget.widget.HyperProgressSeekBar$ProgressAnimTarget", cl);
+            java.lang.reflect.Constructor<?> ctor = targetCls.getDeclaredConstructor(bar.getClass());
+            ctor.setAccessible(true);
+            Object target = ctor.newInstance(bar);
+            Xp.findMethodExact(
+                            Xp.findClass("miuix.animation.Folme", cl), "use",
+                            Xp.findClass("miuix.animation.FolmeObject", cl))
+                    .invoke(null, target);
+            Object impl = Xp.getObjectField(target, "mFolmeImpl");
+            if (impl == null) {
+                Xp.log(TAG + "head animator built but Folme gave it no impl");
+                return;
+            }
+            Xp.setObjectField(bar, "mHeadAlphaAnimator", target);
+            // The resting value the constructor sets. The field already reads 1.0, so a build
+            // where this resolves to a different overload is not worth failing the whole thing
+            // over - the touch path sets its own values from here.
+            try {
+                Xp.callMethod(impl, "setTo",
+                        Xp.getObjectField(bar, "PROPERTY_HEAD_ALPHA"), Float.valueOf(1.0f));
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable t) {
+            Xp.log(TAG + "head animator not built, drag falls back to level 0: " + t);
+        }
+    }
+
+    /**
+     * Puts one bar into the shader mode, by hand, and answers with a line about what happened.
+     *
+     * The three steps are the three things the constructor does for level 2 and skips for level 0:
+     * build the shader, hand it to the field, then run initShaderConfig, which decodes the head
+     * bitmap and pushes every uniform - without it the paint has no shader and the bar draws
+     * nothing at all. onLayout is where the track is sized for this mode, and it has already run,
+     * so the uniforms would stay at their defaults until the next layout pass without it.
+     *
+     * The answer is a string because module logs are not readable on this device: `op seekglow`
+     * hands it back, and "FAILED ..." there is the only way a final-field write that this platform
+     * refuses would ever be seen.
+     */
+    static String applyBarGlow(android.view.View bar) {
+        try {
+            // The island's copies arrive with the mode unset and already run the device's own
+            // level; only the card's bar names a mode, and only that one is ours to light.
+            Object mode = Xp.getObjectField(bar, "mProgressMode");
+            if (!(mode instanceof Integer) || ((Integer) mode) != 0) return "not the card's bar";
+            int level = (Integer) Xp.getObjectField(bar, "mDeviceLevel");
+            if (level != 0) return "already level " + level;
+            android.content.res.Resources res = bar.getContext().getResources();
+            int id = res.getIdentifier(SHADER_ENTRY, "raw", "com.android.systemui");
+            if (id == 0) return "no raw/" + SHADER_ENTRY + " in this build";
+            String src = (String) Xp.callMethod(bar, "loadShader", id, res);
+            Xp.setObjectField(bar, "runtimeShader", new android.graphics.RuntimeShader(src));
+            Xp.setObjectField(bar, "mDeviceLevel", 2);
+            Xp.callMethod(bar, "initShaderConfig");
+            bar.requestLayout();
+            buildHeadAnimator(bar);
+            // Only now is the bar something the touch guard has to cover: it draws as level 2
+            // without having been built as it.
+            sGlowBars.put(bar, Boolean.TRUE);
+            return hasHeadAnimator(bar) ? "level 2 + head" : "level 2, drag as level 0";
+        } catch (Throwable t) {
+            return "FAILED " + t;
+        }
     }
 
     /**

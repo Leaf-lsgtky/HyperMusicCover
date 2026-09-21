@@ -21,7 +21,7 @@ kotlinxSerialization = "1.11.0"
 # and Kugou KRC all come out of one AutoParser, which is the point: the lyric text we can get is
 # whichever of those a source hands us, not one format we picked.
 # Pure Kotlin/JVM with no Android dependencies, so it is safe to load inside SystemUI, and
-# Apache-2.0 - the same licence as this module.
+# Apache-2.0, which the AGPL-3.0 this module is under takes in without complaint.
 lyricsCore = "0.4.7"
 
 [libraries]

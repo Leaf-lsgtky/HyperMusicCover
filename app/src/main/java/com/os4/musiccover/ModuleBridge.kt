@@ -79,6 +79,11 @@ object ModuleBridge {
         val mcArtInLyrics: Boolean = false,
         val mcTitleTap: Boolean = false,
         val hideFingerprint: Boolean = false,
+        /**
+         * Keep cover mode's small clock in the full-screen always-on display, instead of letting
+         * it grow back into the OEM's own AOD clock.
+         */
+        val aodSmall: Boolean = false,
         /** Draw the big clock's colon on the styles that drop it. */
         val forceColon: Boolean = false,
         /** Lock screen lyrics, between the collapsed clock and the card. */
@@ -87,6 +92,8 @@ object ModuleBridge {
         val lyricsKeepOn: Boolean = false,
         /** Draw the singing words brighter than white on an HDR screen. */
         val lyricsHdr: Boolean = false,
+        /** Draw each line's translation under it. On unless the user turns it off. */
+        val lyricsTrans: Boolean = true,
         /**
          * A session has actually carried its own lyric since SystemUI started.
          *
@@ -209,6 +216,9 @@ object ModuleBridge {
     fun setHideFingerprint(context: Context, on: Boolean) =
         send(context, "hidefp") { putExtra("on", on) }
 
+    fun setAodSmall(context: Context, on: Boolean) =
+        send(context, "aodclock") { putExtra("small", on) }
+
     fun setForceColon(context: Context, on: Boolean) =
         send(context, "colon") { putExtra("on", on) }
 
@@ -220,6 +230,9 @@ object ModuleBridge {
 
     fun setLyricsKeepOn(context: Context, on: Boolean) =
         send(context, "lyrickeep") { putExtra("on", on) }
+
+    fun setLyricsTrans(context: Context, on: Boolean) =
+        send(context, "lyrictrans") { putExtra("on", on) }
 
     fun setFingerprintAvoid(context: Context, mode: Int) =
         send(context, "fpavoid") { putExtra("mode", mode) }
@@ -268,16 +281,6 @@ object ModuleBridge {
 
     /** The waits between [queryAlive]'s attempts. Each attempt itself costs up to the timeout. */
     private val RETRY_GAPS_MS = longArrayOf(1000L, 2000L, 4000L, 8000L)
-
-    /**
-     * The module's account of where it put the clock, as text.
-     *
-     * For a lock screen that is wrong on someone else's phone and right on ours: every number
-     * that decides the placement is measured inside SystemUI at the moment it happens, so a
-     * screenshot cannot settle it and neither can anything this side can see. Null means the
-     * module did not answer - the same "not loaded" signal every other query gives.
-     */
-    suspend fun report(context: Context): String? = ask(context, "diag")?.getString("report")
 
     /**
      * A picture of one of SystemUI's own views, with the screen rectangle it occupies.
@@ -462,10 +465,13 @@ object ModuleBridge {
             mcArtInLyrics = b.getBoolean("mclyricart", false),
             mcTitleTap = b.getBoolean("mctap", false),
             hideFingerprint = b.getBoolean("hidefp", false),
+            aodSmall = b.getBoolean("aodsmall", false),
             forceColon = b.getBoolean("colon", false),
             lyrics = b.getBoolean("lyrics", false),
             lyricsKeepOn = b.getBoolean("lyrickeep", false),
             lyricsHdr = b.getBoolean("lyrichdr", false),
+            // Defaults the other way: this one is on for anyone whose module predates the key.
+            lyricsTrans = b.getBoolean("lyrictrans", true),
             sessionLyric = b.getBoolean("sessionlyric", false),
             fpAvoid = b.getInt("fpavoid", 0),
             shade = b.keySet()

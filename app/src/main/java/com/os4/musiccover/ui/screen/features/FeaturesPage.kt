@@ -35,8 +35,10 @@ import com.os4.musiccover.ShadeActivity
 import com.os4.musiccover.ui.util.PageScaffold
 import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Slider
+import top.yukonga.miuix.kmp.basic.SliderDefaults
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TabRow
 import top.yukonga.miuix.kmp.preference.ArrowPreference
@@ -96,8 +98,10 @@ private fun FeatureList(
     ) {
         item {
             Column {
+                // The 12dp under the bar that every other list page in this app leaves. It was
+                // missing on this one card, which put it flush against the title.
                 Card(
-                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp)
                 ) {
                     ArrowPreference(
                         title = stringResource(R.string.features_cover_title),
@@ -300,7 +304,6 @@ private fun CoverGroup(
     val context = LocalContext.current
     ValueSlider(
         title = stringResource(R.string.cover_bias),
-        summary = stringResource(R.string.cover_bias_summary),
         value = module.bias,
         valueRange = 0f..1f,
         enabled = enabled,
@@ -322,7 +325,6 @@ private fun ClockGroup(
         // Where the date and the clock sit, moved as one block from where cover mode puts them.
         ValueSlider(
             title = stringResource(R.string.clock_height),
-            summary = stringResource(R.string.clock_height_summary),
             value = module.clockOffsetDp.coerceIn(CLOCK_OFFSET_MIN_DP, CLOCK_OFFSET_MAX_DP),
             valueRange = CLOCK_OFFSET_MIN_DP..CLOCK_OFFSET_MAX_DP,
             enabled = enabled,
@@ -338,7 +340,6 @@ private fun ClockGroup(
         // collapse cannot make a clock bigger than that, so 100% is the top.
         ValueSlider(
             title = stringResource(R.string.clock_size),
-            summary = stringResource(R.string.clock_size_summary),
             value = (if (module.clockSize > 0f) module.clockSize else DEFAULT_CLOCK_SIZE)
                 .coerceIn(CLOCK_SIZE_MIN, 1f),
             valueRange = CLOCK_SIZE_MIN..1f,
@@ -350,6 +351,20 @@ private fun ClockGroup(
                 ModuleBridge.setClockSize(context, size)
             },
         )
+        // Not a cover setting either, in the same way the colon switch below is not: it is about
+        // the clock the lock screen is showing when the display goes off. About the FULL-SCREEN
+        // always-on display only - the plain AOD is left as the system draws it, and the row no
+        // longer says which of the two it means, so it is worth saying here. Nothing to
+        // re-apply: the module reads it when the screen falls asleep.
+        SwitchPreference(
+            title = stringResource(R.string.clock_aod_small),
+            checked = module.aodSmall,
+            enabled = enabled,
+            onCheckedChange = {
+                onChange(module.copy(aodSmall = it))
+                ModuleBridge.setAodSmall(context, it)
+            },
+        )
         // The spring the whole transition runs on. The number is miuix's response time in
         // seconds and it is not flipped, because the label is a description of feel rather than
         // of the unit: dragging right slows the spring down, and a slower spring with the same
@@ -357,10 +372,14 @@ private fun ClockGroup(
         // side and is not on this slider.
         ValueSlider(
             title = stringResource(R.string.clock_response),
-            summary = stringResource(R.string.clock_response_summary),
             value = module.clockResponse.coerceIn(CLOCK_RESPONSE_MIN, CLOCK_RESPONSE_MAX),
             valueRange = CLOCK_RESPONSE_MIN..CLOCK_RESPONSE_MAX,
             enabled = enabled,
+            // The one detent in the app: this slider's own default, and the value every note
+            // about this transition quotes. Nothing is printed for it - the tick is the only
+            // mark, and it is there so the default can be found again without reading the
+            // number off the row.
+            detent = DEFAULT_CLOCK_RESPONSE,
             onValueChange = {
                 onChange(module.copy(clockResponse = it))
                 ModuleBridge.setClockResponse(context, it)
@@ -371,11 +390,12 @@ private fun ClockGroup(
         // backwards, and dragging right made the effect weaker. The stored value, the adb
         // glassend op and the exported JSON all keep the OEM's meaning; only this slider is
         // flipped.
-        // Off on the styles whose clock has no glass to morph, and saying so. The morph is
-        // AllInOneBase.updateGlassValue(float) - the OEM's own ramp from refracting glass to a
-        // solid fill - and the rhombus, doodle, oriental and magazine clocks have no such thing:
-        // vector digits, bitmaps and plain text. A slider that moves and changes nothing is
-        // worse than one that explains itself.
+        // Off on the styles whose clock has no glass to morph, and saying so - the one row on this
+        // page that keeps a summary. The morph is AllInOneBase.updateGlassValue(float) - the OEM's
+        // own ramp from refracting glass to a solid fill - and the rhombus, doodle, oriental and
+        // magazine clocks have no such thing: vector digits, bitmaps and plain text, so there is
+        // nothing for this slider to move. A slider that cannot be moved and does not say why
+        // reads as broken, and this is the only one here that is ever in that state.
         val glassAvailable = module.clockHasGlass
         ValueSlider(
             title = stringResource(R.string.clock_glass),
@@ -396,7 +416,6 @@ private fun ClockGroup(
         // other restrictions this module lifts do not.
         SwitchPreference(
             title = stringResource(R.string.clock_force_colon),
-            summary = stringResource(R.string.clock_force_colon_summary),
             checked = module.forceColon,
             enabled = enabled,
             onCheckedChange = {
@@ -426,43 +445,85 @@ private fun LyricsGroup(
             }
         }
     }
-    // Advice, not a gate, and said once. The switch works without any provider module - the
-    // lyrics are found by name over the network - so this is worth saying rather than standing
-    // in the way, and worth saying only until it has been read.
-    // Title and body together: the two cases say opposite things about whether the module is
-    // there, so they cannot share a heading - "please install it" over "it is installed" is how
-    // that reads to whoever gets the wrong one.
-    val notice = when {
-        module.sessionLyric -> null
-        providerInstalled ->
-            R.string.lyrics_provider_title_idle to R.string.lyrics_provider_idle
-        else ->
-            R.string.lyrics_provider_title_missing to R.string.lyrics_provider_missing
+    // Three states rather than two, and the difference between the last two is the one worth
+    // showing: installed is not the same question as working. LyricInfo is an LSPosed module,
+    // and one that is installed but not enabled - or enabled without the player in its scope -
+    // writes nothing while still sitting in the package list. The package manager cannot tell
+    // those apart; whether a session has carried its lyric is what does, and only the module
+    // knows that.
+    //
+    // Which player is playing is the other half of the question, and it is the half that was
+    // missing at first. A session lyric is only ever going to appear for a player LyricInfo
+    // knows (see LYRICINFO_PLAYERS); on any other one the lyrics come from the network instead
+    // and "no session lyric" is the normal state of a working phone. Reporting that as "not
+    // working" blames the module for something it never claimed to do - and it is not a corner
+    // case, it is every song on Apple Music.
+    val provider = when {
+        !providerInstalled -> ProviderNotice.Missing
+        module.sessionLyric -> ProviderNotice.Ready
+        module.player in LYRICINFO_PLAYERS -> ProviderNotice.Inactive
+        else -> ProviderNotice.Ready
     }
+    // Said twice, because once was not enough. The row standing at the top of the group is
+    // always there; this is the interruption, and it is only worth interrupting for the two
+    // states that need something done about them.
     var showNotice by remember { mutableStateOf(false) }
-    LaunchedEffect(notice, module.alive) {
+    var countdown by remember { mutableIntStateOf(PROVIDER_NOTICE_SECONDS) }
+    LaunchedEffect(provider, module.alive) {
         // Only once the module has answered: before that every field reads as its default, and
         // "no lyric has ever arrived" would be the state of a phone that had simply not been
         // asked yet.
-        if (notice != null && module.alive && !LyricsNotice.seen(context)) {
+        if (provider != ProviderNotice.Ready && module.alive && !LyricsNotice.seen(context)) {
             showNotice = true
-            LyricsNotice.markSeen(context)
+        }
+    }
+    LaunchedEffect(showNotice) {
+        if (!showNotice) return@LaunchedEffect
+        countdown = PROVIDER_NOTICE_SECONDS
+        while (countdown > 0) {
+            delay(1_000)
+            countdown--
         }
     }
     WindowDialog(
         show = showNotice,
-        title = stringResource(notice?.first ?: R.string.lyrics_provider_title_missing),
-        summary = notice?.second?.let { stringResource(it) },
-        onDismissRequest = { showNotice = false },
+        title = stringResource(provider.title),
+        summary = stringResource(provider.summary),
+        // Held for fifteen seconds, and held means held: an outside tap and the back gesture
+        // both come through here, so there is no way out of it before the button unlocks. A
+        // notice asking for a module to be installed is read by nobody if it can be flicked
+        // away, and on most phones this one has already been flicked away once.
+        onDismissRequest = {
+            if (countdown == 0) {
+                showNotice = false
+                LyricsNotice.markSeen(context)
+            }
+        },
     ) {
         val dismiss = LocalDismissState.current
         TextButton(
             modifier = Modifier.fillMaxWidth(),
-            text = stringResource(R.string.lyrics_provider_got_it),
+            text = if (countdown > 0) {
+                stringResource(R.string.lyrics_provider_got_it_wait, countdown)
+            } else {
+                stringResource(R.string.lyrics_provider_got_it)
+            },
+            enabled = countdown == 0,
             onClick = { dismiss?.invoke() },
         )
     }
     Column {
+        // The standing half of the same statement. It never goes away and it never asks to be
+        // dismissed, which is what makes it useful on the visit after the notice was flicked
+        // away - or on a phone where the module had not answered yet when the notice was due.
+        BasicComponent(
+            title = stringResource(provider.title),
+            titleColor = BasicComponentDefaults.titleColor(
+                color = if (provider.warning) MiuixTheme.colorScheme.error
+                        else MiuixTheme.colorScheme.onBackground,
+            ),
+            summary = stringResource(provider.summary),
+        )
         SwitchPreference(
             title = stringResource(R.string.lock_lyrics),
             summary = stringResource(R.string.lock_lyrics_summary),
@@ -474,8 +535,16 @@ private fun LyricsGroup(
             },
         )
         SwitchPreference(
+            title = stringResource(R.string.lyrics_trans),
+            checked = module.lyricsTrans,
+            enabled = enabled && module.lyrics,
+            onCheckedChange = {
+                onChange(module.copy(lyricsTrans = it))
+                ModuleBridge.setLyricsTrans(context, it)
+            },
+        )
+        SwitchPreference(
             title = stringResource(R.string.lyrics_hdr),
-            summary = stringResource(R.string.lyrics_hdr_summary),
             checked = module.lyricsHdr,
             enabled = enabled && module.lyrics,
             onCheckedChange = {
@@ -485,7 +554,6 @@ private fun LyricsGroup(
         )
         SwitchPreference(
             title = stringResource(R.string.lyrics_keep_on),
-            summary = stringResource(R.string.lyrics_keep_on_summary),
             checked = module.lyricsKeepOn,
             enabled = enabled && module.lyrics,
             onCheckedChange = {
@@ -530,7 +598,6 @@ private fun CardGroup(
         ) {
             SwitchPreference(
                 title = stringResource(R.string.card_art_in_lyrics),
-                summary = stringResource(R.string.card_art_in_lyrics_summary),
                 checked = module.mcArtInLyrics,
                 enabled = enabled,
                 onCheckedChange = { on ->
@@ -552,9 +619,10 @@ private fun CardGroup(
                 ModuleBridge.setCardTitleTap(context, it)
             },
         )
-        // Sits here because that is where it was asked for, but it is not a card setting and
-        // does not follow cover mode - which the summary says, since the two switches above it
-        // do. No onCardRestyled(): the preview above draws no fingerprint.
+        // Sits here because that is where it was asked for, but it is not a card setting and does
+        // not follow cover mode, unlike the switches above it - which the rows no longer say, so
+        // it is only in the module and in this comment. No onCardRestyled(): the preview above
+        // draws no fingerprint.
         SwitchPreference(
             title = stringResource(R.string.hide_fingerprint),
             checked = module.hideFingerprint,
@@ -566,17 +634,21 @@ private fun CardGroup(
         )
         // Three states rather than a switch: "off" would have to mean both "stop reserving the
         // space" and "reserve it even with no print enrolled", which are opposite requests.
+        //
+        // The two directions are named differently on the two sides of the wire: the module and
+        // the OEM call it avoidance, because that is what the fingerprint icon makes the
+        // notification do - move up - and the hook's own job is to override it. The rows say
+        // what the notification does instead, so "sinks" is avoidance switched off: item 1 is
+        // the module's fpavoid=1 and item 2 its fpavoid=2. Change the order here and the
+        // setting silently means the opposite of what it says.
         val avoidModes = listOf(
-            stringResource(R.string.fp_avoid_system),
-            stringResource(R.string.fp_avoid_never),
-            stringResource(R.string.fp_avoid_always),
+            stringResource(R.string.fp_sink_system),
+            stringResource(R.string.fp_sink_always),
+            stringResource(R.string.fp_sink_never),
         )
         val avoidIndex = module.fpAvoid.coerceIn(0, avoidModes.lastIndex)
         WindowDropdownPreference(
-            title = stringResource(R.string.fp_avoid),
-            // The delay is real and would otherwise read as the setting not working, so it is
-            // stated where the setting is, not in a release note.
-            summary = stringResource(R.string.fp_avoid_summary),
+            title = stringResource(R.string.fp_sink),
             items = avoidModes,
             selectedIndex = avoidIndex,
             enabled = enabled,
@@ -606,6 +678,13 @@ private const val CLOCK_RESPONSE_MIN = 0.18f
 private const val CLOCK_RESPONSE_MAX = 0.60f
 
 /**
+ * What the module ships with, and the one detent on any slider here: `EASE_COVER[1]` in Main.java,
+ * the response the cover itself moves on. Named rather than written at the call site because the
+ * detent and the default have to be the same number for either of them to be worth anything.
+ */
+private const val DEFAULT_CLOCK_RESPONSE = 0.38f
+
+/**
  * A slider with its current value printed opposite the title. Without the number there is no way
  * to tell where you have dragged to, which matters here because these values get compared against
  * ones written down in the notes.
@@ -613,14 +692,21 @@ private const val CLOCK_RESPONSE_MAX = 0.60f
  * Shared with ShadePage, which is why it is `internal` rather than private to this file: both
  * pages adjust module settings the same way, and a second slider that looked almost the same was
  * the first thing a reviewer noticed.
+ *
+ * [detent] is a single value on the track that ticks as it is passed - the app's only one, and it
+ * exists because a slider whose default is one number among many is otherwise impossible to find
+ * again by hand. It is miuix's own key point rather than a comparison of this frame's value
+ * against the last, so the tick is the library's and behaves the way every other miuix slider's
+ * does.
  */
 @Composable
 internal fun ValueSlider(
     title: String,
-    summary: String?,
+    summary: String? = null,
     value: Float,
     valueRange: ClosedFloatingPointRange<Float>,
     enabled: Boolean,
+    detent: Float? = null,
     label: (Float) -> String = ::format,
     onValueChange: (Float) -> Unit,
 ) {
@@ -646,6 +732,17 @@ internal fun ValueSlider(
             onValueChange = onValueChange,
             valueRange = valueRange,
             enabled = enabled,
+            // Step is what makes a key point produce a tick at all; the default effect only fires
+            // at the two ends of the track (SliderHapticEffect.Edge), and those ends keep firing
+            // either way, because the edge haptic is played before the key point is looked at.
+            hapticEffect = if (detent != null) SliderDefaults.SliderHapticEffect.Step
+                           else SliderDefaults.DefaultHapticEffect,
+            keyPoints = detent?.let { listOf(it) },
+            // The library's magnet would pull the value onto the key point from 2% of the range
+            // away, which is a snap rather than a tick, and it would take the values just either
+            // side of the detent out of what this slider can be set to. Off, deliberately: the
+            // detent is there to be felt, not to stop the finger short.
+            magnetThreshold = 0f,
         )
     }
 }
@@ -688,7 +785,61 @@ private val LYRIC_PROVIDERS = listOf(
 )
 
 /**
- * Remembers that the lyric-provider advice has been read.
+ * The players LyricInfo can write for, read out of its own APK's dex.
+ *
+ * It hooks a player's internals and republishes what it finds as `lyricInfo` on the media
+ * session, so it only covers the players it was written for - and Apple Music is not one of
+ * them. That is what the lyrics state on this page turns on: whether a session carries a lyric
+ * says nothing about the module unless the player on screen is one the module claims.
+ *
+ * From `pm path com.lidesheng.lyricinfo`, pulled and grepped out of `classes.dex`; the vendor
+ * class names around them (`com.salt.music.service.MusicController`,
+ * `com.luna.biz.playing.player.remote.control.*`) are the hook targets themselves. Both
+ * soda-music names are here because the app has shipped under both - `com.luna.music` and
+ * `com.ikunshare.music.mobile`.
+ */
+private val LYRICINFO_PLAYERS = setOf(
+    "com.netease.cloudmusic",
+    "com.tencent.qqmusic",
+    "com.kugou.android",
+    "com.miui.player",
+    "com.salt.music",
+    "com.luna.music",
+    "com.ikunshare.music.mobile",
+    "com.hihonor.cloudmusic",
+)
+
+/** How long the provider notice holds its own dismiss button, in seconds. */
+private const val PROVIDER_NOTICE_SECONDS = 15
+
+/**
+ * What the page says about the lyric provider module.
+ *
+ * Three states rather than two, because "installed" is not the question that matters: LyricInfo
+ * is an LSPosed module, and one that is installed but not enabled - or enabled without the
+ * player in its scope - writes nothing while still sitting in the package list. Both of the
+ * first two are asking for something to be done, which is what [warning] is for; the third is
+ * only saying what the module does and does not cover.
+ */
+private enum class ProviderNotice(
+    val title: Int,
+    val summary: Int,
+    val warning: Boolean,
+) {
+    /** Not in the package list at all. */
+    Missing(R.string.lyrics_provider_title_missing, R.string.lyrics_provider_missing, true),
+    /** Installed, but no session has carried its lyric since SystemUI started. */
+    Inactive(R.string.lyrics_provider_title_inactive, R.string.lyrics_provider_inactive, true),
+    /** Installed and writing. Apps outside its scope can still miss, which is worth saying. */
+    Ready(R.string.lyrics_provider_title_ready, R.string.lyrics_provider_ready, false),
+}
+
+/**
+ * Remembers that the lyric-provider notice has been dismissed.
+ *
+ * Marked when the notice closes rather than when it opens, so a phone that was locked or a page
+ * that was left before the button unlocked has not "been told" - the fifteen seconds it holds
+ * for are the point, and cutting them short is not reading it.
  *
  * Belongs to the app rather than the module: it is about what this phone's owner has been told,
  * not about how the lock screen behaves, and it has to survive the module being restarted.

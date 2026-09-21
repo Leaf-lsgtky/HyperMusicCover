@@ -1,47 +1,68 @@
 HyperMusicCover
-Copyright 2026 zyl6932
+Copyright (C) 2026 zyl6932
 
-This product includes software developed as part of HyperNavBar
-(https://github.com/HyperNavBar/HyperNavBar), licensed under the
-Apache License, Version 2.0.
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 of the License.
 
-The user interface scaffolding - theme handling, the floating and liquid-glass
-navigation bars, the progressive background blur, the animated background effect,
-the About and licence pages and the locale helper - is adapted from that project.
-Files carrying those changes are marked in their headers.
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
 
-This product includes software developed as part of KernelSU
-(https://github.com/tiann/KernelSU), licensed under the Apache License,
-Version 2.0.
+You should have received a copy of the GNU Affero General Public License along
+with this program; the full text is in LICENSE at the root of this repository,
+and at <https://www.gnu.org/licenses/agpl-3.0.txt>.
 
-The menu position provider, the menu row and the pager navigation spring are
-adapted from that project, and the home page's status card follows its layout.
-Files carrying those changes are marked in their headers.
+The complete corresponding source for every published build is this repository:
+<https://github.com/zyl6932/HyperMusicCover>
 
-This product includes miuix
-(https://github.com/miuix-kotlin-multiplatform/miuix), licensed under the
-Apache License, Version 2.0.
+--------------------------------------------------------------------------------
+Third-party code
+--------------------------------------------------------------------------------
 
-This product includes software developed as part of AndroidLiquidGlass
-(https://github.com/Kyant0/AndroidLiquidGlass), licensed under the Apache
-License, Version 2.0.
+Parts of this program are adapted from the projects below and remain under the
+licences stated here. The files carrying those changes are marked in their
+headers, and the notices are reproduced here as those licences require.
 
-The lens, the inner shadow, the vibrancy and the combined backdrop behind the
-liquid-glass navigation bar are adapted from that project. Files carrying those
-changes are marked in their headers.
+GNU General Public License, version 3
+-------------------------------------
+Combined into this AGPL-3.0 work under GPLv3 section 13 and AGPLv3 section 13,
+which permit the combination; the combined work as a whole is distributed under
+the AGPL-3.0. These files are not relicensed.
 
-This product includes software developed as part of HyperChanger
-(https://github.com/ColdP/HyperChanger), licensed under the Apache License,
-Version 2.0.
+  KernelSU (https://github.com/tiann/KernelSU)
+  The menu position provider and the menu row are adapted from that project,
+  and the home page's status card follows its layout.
 
-The hooks that lift HyperOS's depth-effect restrictions, raise the saved lock
-screen limit, force the clock's colon and keep the soft glass through a global
-theme are adapted from that project. The file carrying those changes is marked
-in its header.
+Apache License, Version 2.0
+---------------------------
+One-way compatible with the AGPL-3.0, so these files are distributed here as
+part of the whole without being relicensed.
 
-This product includes accompanist-lyrics-core
-(https://github.com/6xingyv/accompanist-lyrics-core), licensed under the
-Apache License, Version 2.0.
+  HyperNavBar (https://github.com/HyperNavBar/HyperNavBar)
+  The user interface scaffolding - theme handling, the floating and liquid-glass
+  navigation bars, the progressive background blur, the animated background
+  effect, the About and licence pages and the locale helper - is adapted from
+  that project.
+
+  miuix (https://github.com/compose-miuix-ui/miuix)
+  The background effect, the drag animation, the interactive highlight and the
+  liquid-glass pieces (the lens, the inner shadow, the vibrancy and the combined
+  backdrop) come from that project's example app, as do the pager navigation
+  spring's stiffness and damping. Those files carry its copyright line.
+
+  AndroidLiquidGlass (https://github.com/Kyant0/AndroidLiquidGlass)
+  The lens, the inner shadow, the vibrancy and the combined backdrop behind the
+  liquid-glass navigation bar are adapted from that project.
+
+  HyperChanger (https://github.com/ColdP/HyperChanger)
+  The hooks that lift HyperOS's depth-effect restrictions, raise the saved lock
+  screen limit, force the clock's colon and keep the soft glass through a global
+  theme are adapted from that project. The file carrying those changes is marked
+  in its header.
+
+  accompanist-lyrics-core (https://github.com/6xingyv/accompanist-lyrics-core)
+  The lock screen lyric parser, used unmodified as a dependency.
 
 The in-app credits page lists every project this one learnt from, including the
 ones whose ideas rather than whose code are here.

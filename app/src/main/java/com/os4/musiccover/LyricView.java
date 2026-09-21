@@ -89,12 +89,44 @@ final class LyricView extends View {
      * their blur and the inactive level, they all but vanished.
      */
     private static final float EDGE_FADE_DP = 26f;
-    /** Where the singing line's top sits, as a fraction down the band. */
-    private static final float ANCHOR = 0.23f;
-    private static final float CLOCK_GAP_DP = 22f;
+    /**
+     * Where the singing line's top sits, as a fraction down the band.
+     *
+     * Only a fraction of a row now, not of the block: anchorY lays the rows out from the band's
+     * middle, so this decides how many of them sit above the focus - which is what the depth blur
+     * is measured from, and so how much of the stack above the singing line is in focus - and no
+     * longer where the block is. It can be turned without touching the margins. On this band,
+     * 0.23 holds one line above the focus, 0.40 two, 0.50 three.
+     */
+    private static final float ANCHOR = 0.40f;
+    /**
+     * The room between the lyrics and the clock, and between them and the media card.
+     *
+     * One number for both ends. The band is what is left of the screen between the clock's ink
+     * and the card's top, and the lyrics are a whole number of rows laid out from its middle, so
+     * two different numbers here came out as one margin visibly wider than the other: on
+     * 2026-09-17 the first row sat 52dp below the clock with the last 37dp above the card.
+     */
+    private static final float CLOCK_GAP_DP = 16f;
     private static final float CARD_GAP_DP = 16f;
     /** A band shorter than this many rows of text is not worth showing lyrics in. */
     private static final float MIN_BAND_ROWS = 2.4f;
+    /**
+     * How long the block takes to slide to a new centre, once the band or the rows in it change.
+     *
+     * The centring is a step function: it asks how many of the rows fit between the clock and the
+     * card, and one row more or less moves the block half a row at once. The band crosses those
+     * thresholds while it is still moving - on the way into cover mode the clock is collapsing and
+     * the card rising, so the count goes 4, 5, 6 as the room appears - and each crossing used to
+     * land in a single frame. Same when a line long enough to wrap scrolls into the block: it is
+     * two rows tall where its neighbours are one, so the block's height and its centre move
+     * together. Easing the correction turns both into a slide.
+     *
+     * Short enough to read as the block settling rather than as the lyrics lagging behind: the
+     * band's own ends are not eased at all, so everything the clock and the card do is still
+     * tracked frame for frame.
+     */
+    private static final float TAU_ANCHOR = 0.09f;
 
     // ---- depth
     /**
@@ -259,6 +291,10 @@ final class LyricView extends View {
     private int buildGen;
     /** The lines and width a layout is on its way for, or -1 with none in the air. */
     private int wantVersion = -1, wantWidth = -1;
+    /** The translation switch the layout in the air is for; -1 above means none is. */
+    private boolean wantTrans;
+    /** The translation switch the layout now in use was made under. */
+    private boolean builtTrans = true;
     /** Diagnostics: how long the last layout took on its thread. */
     private long layoutMs;
     /** From this distance on the blur is wide enough to be made at a quarter of the resolution. */
@@ -292,6 +328,12 @@ final class LyricView extends View {
     private float show;
     private float bandTop, bandBottom;
     private boolean bandOk;
+    /**
+     * The centring correction in force this frame, and the one the geometry is asking for, both
+     * off the uncentred anchor and both in this view's pixels. Equal at rest; they differ only
+     * while the block is sliding to a new centre (see TAU_ANCHOR).
+     */
+    private float anchorFix, anchorFixWant;
 
     private long lastStep;
 
@@ -394,13 +436,18 @@ final class LyricView extends View {
         float dt = lastStep == 0L ? 0f : Math.min(0.05f, (now - lastStep) / 1000f);
         lastStep = now;
 
-        boolean changed = false;
+        boolean changed = followAodDim();
         int why = 0;
         // Not before the first layout: a width of zero would wrap every line a character a row.
         // Leaving, the lines are frozen like the band below: switching the lyrics off empties
         // them, and laying the empty set out at once cut the lines off in one frame instead of
         // letting them fade.
-        if (getWidth() > 0 && (LockLyrics.version() != version || getWidth() != layoutWidth)
+        if (getWidth() > 0 && (LockLyrics.version() != version || getWidth() != layoutWidth
+                // The translation switch changes the layout, not just the drawing: it takes a
+                // row out from under every line, so it is asked for the same way a new lyric set
+                // is. Compared against what the layout in use was built with, not the field, or
+                // the request would still look outstanding the moment it landed.
+                || LockLyrics.sTrans != builtTrans)
                 && (LockLyrics.wantsAttached() || show == 0f)) {
             if (layOut()) {
                 changed = true;
@@ -412,6 +459,25 @@ final class LyricView extends View {
         if (LockLyrics.wantsShown() && updateBand()) {
             changed = true;
             why |= 2;
+        }
+
+        // The block's centre, slid to rather than cut to. Snapped whenever there is nothing to
+        // slide: hidden or not yet shown, so each arrival starts from the right place instead of
+        // easing up from wherever the last one left off, and whenever there is no block to
+        // centre, so a correction from the previous song cannot outlive it.
+        anchorFixWant = anchorFixTarget();
+        float before = anchorFix;
+        if (dt <= 0f || show < 0.02f || !centring()) {
+            anchorFix = anchorFixWant;
+        } else {
+            anchorFix = approach(anchorFix, anchorFixWant, dt, TAU_ANCHOR);
+            // Land on it exactly: a correction that keeps closing by a hundredth of a pixel keeps
+            // the view invalidating forever, and nothing here is drawn at that resolution anyway.
+            if (Math.abs(anchorFixWant - anchorFix) < 0.01f) anchorFix = anchorFixWant;
+        }
+        if (anchorFix != before) {
+            changed = true;
+            why |= 512;
         }
 
         float showTo = showTarget();
@@ -483,6 +549,9 @@ final class LyricView extends View {
             float to = dots >= 0 ? dotsTop[dots] : base[sf];
             if (first) {
                 snap(to);
+                // A freshly laid out song has nowhere to slide from, and the correction it needs
+                // is not the one the song before it left behind: taken, not eased into.
+                anchorFix = anchorFixWant = anchorFixTarget();
             } else if (seek) {
                 // A drag scrolls there rather than cutting, however far it went - watching the
                 // lyrics travel is what makes a seek legible, and the direction it travels says
@@ -519,8 +588,7 @@ final class LyricView extends View {
                     springC = (float) Math.sqrt(springK) * DAMPING_MULT;
                 }
                 // The ripple, counted from the first line whose target is on screen.
-                float bandH = bandBottom - bandTop;
-                float anchor = bandTop + ANCHOR * bandH;
+                float anchor = anchorY();
                 float delay = 0f, step = RIPPLE_MS;
                 for (int i = 0; i < n; i++) {
                     aimAt[i] = now + Math.round(delay);
@@ -683,9 +751,55 @@ final class LyricView extends View {
         return v;
     }
 
+    /** keyguard_info_layer, the view the full AOD dims - the one the lyrics take their alpha from. */
+    private View dimSource;
+
+    /**
+     * The alpha the full always-on display is currently dimming the keyguard by.
+     *
+     * The OEM applies that dim to six views by name and this one is not among them: the lyrics
+     * live in `keyguard_foreground_layer`, a sibling of `keyguard_info_layer` under the same
+     * `constraintLayout` (KeyguardPanelViewController 1239-1262 and 5665-5674). Left alone they
+     * would sit at full brightness over a screen that had just darkened itself.
+     *
+     * Read from that sibling rather than from a constant so the 500ms descent is followed frame
+     * for frame, and looked up again whenever it is not attached - the keyguard is rebuilt.
+     */
+    private float dimTarget() {
+        if (!LockLyrics.inHeldAod()) return 1f;
+        View s = dimSource;
+        if (s == null || !s.isAttachedToWindow()) {
+            View root = getRootView();
+            int id = getContext().getResources()
+                    .getIdentifier("keyguard_info_layer", "id", "com.android.systemui");
+            s = id == 0 || root == null ? null : root.findViewById(id);
+            dimSource = s;
+        }
+        return s == null ? 1f : s.getTransitionAlpha();
+    }
+
+    /** @return whether it moved, so a dim of the keyguard keeps this view asking for frames */
+    private boolean followAodDim() {
+        float want = dimTarget();
+        if (getTransitionAlpha() == want) return false;
+        setTransitionAlpha(want);
+        return true;
+    }
+
     private boolean needsFrames() {
         if (!isAttachedToWindow()) return false;
         if (show != showTarget()) return true;
+        // The keyguard dimming around us is a movement like any other, and so is the keyguard
+        // coming back: without this the loop would stop the moment the words settled and leave
+        // the lyrics at whatever alpha the AOD had put them at - dimmed on a lit screen, or at
+        // full brightness on one that has just dimmed itself. Asked in both directions, because
+        // dimTarget() is 1 outside the AOD and the frame that wakes the keyguard may change
+        // nothing else.
+        if (getTransitionAlpha() != dimTarget()) return true;
+        // The block sliding to a new centre is a movement like any other, and the slowest one
+        // here: without this the loop would stop the moment the springs settled and leave the
+        // correction half way.
+        if (anchorFix != anchorFixWant) return true;
         ClockCollapse.Phase p = ClockCollapse.phase();
         if (p == ClockCollapse.Phase.ENTER || p == ClockCollapse.Phase.EXIT) return true;
         if (lines.isEmpty() || focus < 0 || show == 0f) return false;
@@ -837,15 +951,18 @@ final class LyricView extends View {
     private boolean layOut() {
         final int v = LockLyrics.version();
         final int width = getWidth();
+        final boolean transOn = LockLyrics.sTrans;
         final List<LyricLine> ls = LockLyrics.lines();
         if (ls.isEmpty()) {
             wantVersion = wantWidth = -1;
-            apply(build(v, width, ls, paint, bgPaint, transPaint));
+            wantTrans = transOn;
+            apply(build(v, width, ls, paint, bgPaint, transPaint, transOn));
             return true;
         }
-        if (v == wantVersion && width == wantWidth) return false;
+        if (v == wantVersion && width == wantWidth && transOn == wantTrans) return false;
         wantVersion = v;
         wantWidth = width;
+        wantTrans = transOn;
         // Copies: the view's paints are recoloured on every frame. Each layout draws with the
         // copy it was built with from here on - see drawStatic.
         final TextPaint p = new TextPaint(paint);
@@ -854,16 +971,17 @@ final class LyricView extends View {
         layoutHandler().post(new Runnable() {
             @Override
             public void run() {
-                final Built b = build(v, width, ls, p, bp, tp);
+                final Built b = build(v, width, ls, p, bp, tp, transOn);
                 post(new Runnable() {
                     @Override
                     public void run() {
                         // Overtaken by a newer request: that one's answer is the one to wait for.
-                        if (v != wantVersion || width != wantWidth) return;
+                        if (v != wantVersion || width != wantWidth || transOn != wantTrans) return;
                         wantVersion = wantWidth = -1;
                         // Stale by the time it landed, or asked for and then frozen by the lyrics
                         // being switched off: the next step asks again when it is due.
                         if (v != LockLyrics.version() || width != getWidth()
+                                || transOn != LockLyrics.sTrans
                                 || !LockLyrics.wantsAttached()) {
                             return;
                         }
@@ -880,6 +998,8 @@ final class LyricView extends View {
     /** One layout of the lines, made wherever build ran. */
     private static final class Built {
         int version, width, w;
+        /** The translation switch this layout was made under; see LockLyrics.sTrans. */
+        boolean transOn;
         List<LyricLine> lines;
         StaticLayout[] main, trans, bgLay;
         float[] base, height, dotsTop;
@@ -889,11 +1009,12 @@ final class LyricView extends View {
 
     /** Touches nothing of the view's but its constants, so it can run off the UI thread. */
     private Built build(int v, int width, List<LyricLine> ls, TextPaint p, TextPaint bp,
-                        TextPaint tp) {
+                        TextPaint tp, boolean transOn) {
         long t0 = SystemClock.uptimeMillis();
         Built b = new Built();
         b.version = v;
         b.width = width;
+        b.transOn = transOn;
         b.lines = ls;
         int n = ls.size();
         int w = Math.max(1, width - Math.round(2f * SIDE_DP * density));
@@ -938,7 +1059,10 @@ final class LyricView extends View {
                 h += BG_GAP_DP * density + b.bgLay[i].getHeight();
                 if (l.hasWords()) b.charXBg[i] = charXOf(b.bgLay[i], l.bg);
             }
-            if (l.translation != null) {
+            // Left out of the layout entirely when the switch is off, rather than laid out and
+            // skipped in the draw: the rows it would have taken are most of a line's height, and
+            // a gap there would leave every line floating with a hole under it.
+            if (l.translation != null && transOn) {
                 b.trans[i] = StaticLayout.Builder.obtain(l.translation, 0, l.translation.length(),
                                 tp, w)
                         .setAlignment(align)
@@ -957,6 +1081,7 @@ final class LyricView extends View {
     /** Puts a finished layout in, and starts every line's animated state over. UI thread. */
     private void apply(Built b) {
         version = b.version;
+        builtTrans = b.transOn;
         lines = b.lines;
         layoutWidth = b.width;
         layoutMs = b.tookMs;
@@ -1011,16 +1136,19 @@ final class LyricView extends View {
         // Two getLocationOnScreen walks a frame are not free, and this runs from the keyguard's
         // pre-draw: nothing to show, nothing to measure.
         if (lines.isEmpty() && show == 0f) return false;
-        float clock = ClockCollapse.inkBottomOnScreen();
-        View card = LockLyrics.card();
+        float clock = ClockCollapse.contentBottomOnScreen();
+        // The band's own lower edge, not the card view: the lock screen's media card can be hidden
+        // for a whole song - the music capsule hides it outright, see
+        // LockLyrics.bandBottomOnScreen() - and when it is, the band fills the block the card
+        // would have taken rather than stopping above a card nobody is drawing.
+        float floor = LockLyrics.bandBottomOnScreen();
         boolean ok = false;
         float top = bandTop, bottom = bandBottom;
-        if (!Float.isNaN(clock) && card != null && card.isShown() && isAttachedToWindow()) {
+        if (!Float.isNaN(clock) && isAttachedToWindow()) {
             getLocationOnScreen(loc);
             float me = loc[1];
-            card.getLocationOnScreen(loc);
             top = clock + CLOCK_GAP_DP * density - me;
-            bottom = loc[1] - CARD_GAP_DP * density - me;
+            bottom = floor - CARD_GAP_DP * density - me;
             ok = bottom - top >= MIN_BAND_ROWS * textPx;
         }
         boolean changed = ok != bandOk
@@ -1031,6 +1159,62 @@ final class LyricView extends View {
             bandBottom = bottom;
         }
         return changed;
+    }
+
+    /** Whether there is a block of rows to centre: a measured band, and a focus line inside it. */
+    private boolean centring() {
+        int n = lines.size();
+        return bandOk && focus >= 0 && focus < n && base.length == n && height.length == n;
+    }
+
+    /**
+     * How far the block wants to sit from the band's uncentred anchor, in this view's pixels.
+     *
+     * A band holds a whole number of rows and its ends are fixed by the clock and the card, so
+     * pinning the singing line to a fraction of the band left the remainder wherever the rows
+     * happened to fall - under the first row when the band held only just enough of them, above
+     * the last when it did not. Laying the rows the band holds out from the band's middle splits
+     * that remainder between the two margins rather than leaving all of it at one of them.
+     *
+     * Measured off `base` and `height` rather than counted in pitches: a wrapped line is two rows
+     * tall and a line with an interlude slot above it sits further down again, so the block is
+     * whatever the band holds, not a number of pitch-sized slots. It is measured against the
+     * uncentred anchor, and that anchor is a fraction of the band, so the answer is the same for
+     * a whole line's travel: this cannot fight the spring, and it changes only when the band or
+     * the rows under it do.
+     *
+     * A correction, not a position, because it is the part of the placement that steps and the
+     * band is the part that moves: step() eases this and leaves the band alone.
+     */
+    private float anchorFixTarget() {
+        if (!centring()) return 0f;
+        float bandH = bandBottom - bandTop;
+        float anchor = bandTop + ANCHOR * bandH;
+        int n = lines.size();
+        // Rows are at least a line's gap apart, so this brackets whatever the band can hold.
+        int span = 2 + (int) (bandH / Math.max(1f, GAP_DP * density));
+        int lo = Math.max(0, focus - span), hi = Math.min(n - 1, focus + span);
+        int first = -1, last = -1;
+        for (int i = lo; i <= hi; i++) {
+            float y = anchor + base[i] - base[focus];
+            if (y >= bandTop && y + height[i] <= bandBottom) {
+                if (first < 0) first = i;
+                last = i;
+            }
+        }
+        if (first < 0) return 0f;
+        float blockH = base[last] - base[first] + height[last];
+        // The uncentred anchor drops out: where the block sits is the band's and its rows' doing.
+        return bandTop + (bandH - blockH) / 2f + base[focus] - base[first] - anchor;
+    }
+
+    /**
+     * Where the singing line's layout top goes this frame. Read by the ripple when a line changes
+     * and by every draw, always off the value step() settled on for this frame, so the two cannot
+     * disagree about where the block is.
+     */
+    private float anchorY() {
+        return bandTop + ANCHOR * (bandBottom - bandTop) + anchorFix;
     }
 
     // ------------------------------------------------------------------ drawing
@@ -1053,7 +1237,7 @@ final class LyricView extends View {
         // as one block: a line's alpha is taken from its own position against the band's edges,
         // and offsetting the canvas instead would have left those alphas describing where the
         // line was going to be rather than where it is.
-        float anchor = bandTop + ANCHOR * bandH + (1f - show) * FLOAT_DP * density;
+        float anchor = anchorY() + (1f - show) * FLOAT_DP * density;
         float side = SIDE_DP * density;
         float fade = Math.min(EDGE_FADE_DP * density, bandH / 3f);
         int n = lines.size();
@@ -1378,7 +1562,7 @@ final class LyricView extends View {
                 c.restoreToCount(save);
                 below += bgGap + bl.getHeight();
             }
-            if (l.translation != null) {
+            if (l.translation != null && LockLyrics.sTrans) {
                 tp.setAlpha(Math.round(255f * TRANS_ALPHA));
                 tp.setMaskFilter(mf);
                 StaticLayout t = StaticLayout.Builder.obtain(l.translation, 0,
@@ -1635,7 +1819,7 @@ final class LyricView extends View {
     }
 
     /** Diagnostics: which state asked for a redraw, per step, since the last describe(). */
-    private final int[] whyCount = new int[9];
+    private final int[] whyCount = new int[10];
     private int stepCount, drawCount;
 
     /**
@@ -1683,7 +1867,8 @@ final class LyricView extends View {
         int words = 0;
         for (LyricLine l : lines) if (l.hasWords()) words++;
         StringBuilder w = new StringBuilder();
-        String[] names = {"rebuild", "band", "show", "focus", "scroll", "snap", "emph", "blur", "words"};
+        String[] names = {"rebuild", "band", "show", "focus", "scroll", "snap", "emph", "blur",
+                "words", "anchor"};
         for (int b = 0; b < whyCount.length; b++) {
             if (whyCount[b] > 0) w.append(names[b]).append('=').append(whyCount[b]).append(',');
             whyCount[b] = 0;
@@ -1700,7 +1885,10 @@ final class LyricView extends View {
         drawNsMax = drawNsSum = 0L;
         return "lines=" + lines.size() + " wordLines=" + words + " layoutMs=" + layoutMs + counts
                 + " focus=" + focus + " ms=" + ms + " show=" + show
-                + " band=" + (bandOk ? Math.round(bandTop) + ".." + Math.round(bandBottom) : "none")
+                // The route the band's lower edge came by, so a band placed off the fallback can
+                // be told apart from one that was measured.
+                + " band=" + (bandOk ? Math.round(bandTop) + ".." + Math.round(bandBottom)
+                        + "(" + LockLyrics.bandSource() + ")" : "none")
                 + " looping=" + looping + " parent=" + (getParent() instanceof ViewGroup);
     }
 }

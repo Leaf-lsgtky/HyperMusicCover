@@ -148,9 +148,64 @@ object LyricParse {
         while (n > 0 && text[n - 1].isWhitespace()) n--
         if (n == 0) return null
         for (k in chars.indices) if (chars[k] > n) chars[k] = n
+        closeUntimedTail(starts, ends, line.end)
         return LyricLine(text.substring(0, n), line.translation, line.start, line.end,
             line.alignment == KaraokeAlignment.End, starts, ends, chars)
     }
+
+    /**
+     * The words at the end of a line that the source left without a span of their own take the
+     * room it was leaving them.
+     *
+     * Word timing routinely runs out before the line does. A file that times a line by its words
+     * alone has nowhere to read the last word's end from, and one that carries a duration per
+     * word has nothing to say for a note the singer holds on: either way the last word arrives
+     * with its end missing, or set equal to its own start. That is invisible anywhere else in a
+     * line - sungChars() walks the syllables looking for the one the moment falls in, and a word
+     * nobody is inside is simply stepped over - but at the end of a line there is no next word to
+     * hand the fill on to, so the walk runs off the end of the array and reports the whole line
+     * sung. The fill then crosses the last word in a single frame instead of sweeping it, and the
+     * word is never the second long that the glow asks for.
+     *
+     * A word left without a span runs to the end of the line. Words that share a start - which is
+     * what a wholly untimed tail looks like - divide that stretch between them, rather than
+     * crossing together, so the fill still moves through them one at a time.
+     */
+    private fun closeUntimedTail(starts: IntArray, ends: IntArray, lineEnd: Int) {
+        var k = 0
+        while (k < starts.size) {
+            if (ends[k] > starts[k]) {
+                k++
+                continue
+            }
+            // The run of untimed words this one belongs to.
+            var last = k
+            while (last + 1 < starts.size && ends[last + 1] <= starts[last + 1]) last++
+            val from = starts[k]
+            // A later word that starts later is where the run has to be over by. At the tail
+            // there is none of those, and the line's own end closes it.
+            var to = lineEnd
+            for (m in last + 1 until starts.size) {
+                if (starts[m] > from) {
+                    to = starts[m]
+                    break
+                }
+            }
+            // A line whose own end is no later than its last word - which is what a file that
+            // times lines by their words alone reports - leaves nothing to go on.
+            if (to <= from) to = from + NOMINAL_WORD_MS * (last - k + 1)
+            val count = last - k + 1
+            for (m in k..last) ends[m] = from + (to - from) * (m - k + 1) / count
+            k = last + 1
+        }
+    }
+
+    /**
+     * What a word is given when even the line it sits in has no end left to reach. Only a file
+     * that times its lines by words alone gets here; about a word's worth of room, so it sweeps
+     * rather than snaps.
+     */
+    private const val NOMINAL_WORD_MS = 300
 
     /** "筷：" or "Jay: " at the head of a line - a name, then a full- or half-width colon. */
     private val LABEL = Regex("^([^\\s\\d:：]{1,6})\\s*[:：]\\s*")

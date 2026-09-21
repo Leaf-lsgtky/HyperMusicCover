@@ -135,12 +135,12 @@ final class LyricSource {
         }
         try {
             org.json.JSONObject o = new org.json.JSONObject(json);
-            String lyric = o.optString("lyric", "");
-            String raw = o.optString("rawLyric", "");
-            if (TIMED.matcher(lyric).find()) {
+            String lyric = jsonString(o, "lyric");
+            String raw = jsonString(o, "rawLyric");
+            if (lyric != null && TIMED.matcher(lyric).find()) {
                 return lyric;
             }
-            if (TIMED.matcher(raw).find()) {
+            if (raw != null && TIMED.matcher(raw).find()) {
                 return raw;
             }
             return null;
@@ -154,13 +154,29 @@ final class LyricSource {
     static String rawOfLyricInfo(String json) {
         if (json == null || json.isEmpty()) return null;
         try {
-            String raw = new org.json.JSONObject(json).optString("rawLyric", "");
+            String raw = jsonString(new org.json.JSONObject(json), "rawLyric");
             // Not tested against TIMED: word-timed formats (YRC, QRC, TTML) do not use LRC's
             // [mm:ss] tags at all. Whether it is usable is decided by parsing it.
-            return raw.trim().isEmpty() ? null : raw;
+            return raw == null || raw.trim().isEmpty() ? null : raw;
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /**
+     * A string field of a payload, or null when it is absent, null, or not a string at all.
+     *
+     * Not optString(key, ""), which answers a different question on Android than it does on the
+     * JVM: there a JSON null is a sentinel object and optString returns String.valueOf(that) -
+     * the string "null" - where the fallback was asked for. A player publishing an empty shell
+     * while it looks the lyrics up writes exactly that, and reading it as a lyric whose text is
+     * "null" made hasLyricInfo() report that the session had one when it did not, which is the
+     * signal the caller uses to decide whether the lyrics it settled for are worth replacing.
+     * The same rule, and the same trap, cost the NetEase route a whole song: see NcmLyrics.str.
+     */
+    private static String jsonString(org.json.JSONObject o, String key) {
+        Object v = o.opt(key);
+        return v instanceof String ? (String) v : null;
     }
 
     /**
@@ -499,7 +515,7 @@ final class LyricSource {
             }
             r.lines = LyricParse.parse(a.body);
             r.why = r.lines.isEmpty()
-                    ? join(before, "parsed to nothing (" + dir + ")")
+                    ? join(before, "parsed to nothing (" + dir + ") " + shape(a.body))
                     : r.lines.size() + " lines from " + dir;
             if (!r.lines.isEmpty()) r.source = SRC_DATABASE;
         } catch (Throwable t) {
@@ -519,7 +535,7 @@ final class LyricSource {
             }
             r.lines = LyricParse.parse(f.body, f.translation);
             r.why = r.lines.isEmpty()
-                    ? join(before, "NetEase " + f.id + " parsed to nothing")
+                    ? join(before, "NetEase " + f.id + " parsed to nothing " + shape(f.body))
                     : r.lines.size() + " lines from NetEase " + f.id
                     + " (" + (f.words ? "yrc" : "lrc") + ")";
             if (!r.lines.isEmpty()) r.source = SRC_NETEASE;
@@ -535,6 +551,28 @@ final class LyricSource {
             return now;
         }
         return now == null ? before : before + "; " + now;
+    }
+
+    private static final int SHAPE_HEAD = 60;
+
+    /**
+     * The shape of a body that parsed to nothing: how long it is, and what it starts with.
+     *
+     * "Parsed to nothing" alone is the one account here that cannot be acted on - it says the
+     * parser refused without saying what it refused, and the parser is never where the fault is.
+     * Every other line in this file says which route failed and how, on the argument that that is
+     * the first thing asked of a song showing no lyrics; this one was the exception and it cost
+     * an afternoon. The body behind it for 带你飞 was the four characters "null", handed over in
+     * place of the song by a platform quirk (see NcmLyrics.str), and nothing in the account could
+     * say so. Quoted and kept to one line, because the probe prints the whole account inline.
+     */
+    private static String shape(String body) {
+        if (body == null) {
+            return "(no body)";
+        }
+        String head = body.length() > SHAPE_HEAD ? body.substring(0, SHAPE_HEAD) + "..." : body;
+        return body.length() + " chars, head=\"" + head.replace("\n", "\\n").replace("\r", "")
+                + '"';
     }
 
     /**

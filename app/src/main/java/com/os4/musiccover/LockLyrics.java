@@ -1,5 +1,6 @@
 package com.os4.musiccover;
 
+import android.content.Intent;
 import android.media.session.MediaController;
 import android.media.session.PlaybackState;
 import android.os.SystemClock;
@@ -34,6 +35,20 @@ final class LockLyrics {
     /** The user's switch. Off by default: it fetches from the network inside SystemUI. */
     static volatile boolean sEnabled;
 
+    /**
+     * Whether the lock screen's two-finger tap has taken the lyrics away for this look.
+     *
+     * A view of the switch, not the switch. The setting above is what the user asked for and
+     * what the state file holds; this says only that one lock screen is showing the cover
+     * instead, so a tap costs the lyrics until the next look and never the setting itself.
+     *
+     * It is cleared when the switch is set - off and on again brings them back rather than
+     * returning to a hidden lock screen - and when cover mode comes up, because a tap is an
+     * answer about the lock screen it was made on. Written by setEnabled and toggleByTap and
+     * nowhere else; Main reads it, never writes it.
+     */
+    static volatile boolean sTapHidden;
+
     private static String sKey = "";
     private static List<LyricLine> sLines = Collections.emptyList();
     private static int sVersion;
@@ -56,6 +71,15 @@ final class LockLyrics {
      * changes colour too (reported 2026-09-16). Doing it without that needs its own window.
      */
     static volatile boolean sHdr = false;
+    /**
+     * The fourth switch: whether a line's translation is drawn under it.
+     *
+     * On by default, because it is what the lyrics look like when the source has one: off is for
+     * people who read the language and find the second line in the way. It is not a filter on
+     * what is fetched - the layout drops the translation's rows, so the lines close up rather
+     * than leaving a gap where it was.
+     */
+    static volatile boolean sTrans = true;
     /** How far above SDR white the window may go; the text asks for less than this. */
     private static final float HDR_HEADROOM = 4f;
     private static Object sShadeWindow;
@@ -75,16 +99,44 @@ final class LockLyrics {
      */
     private static int sSource = LyricSource.SRC_NONE;
     /**
-     * What the wallpaper process was last told about the blur. Null = unknown.
+     * What the wallpaper process was last told about the blur, and when that answer was made.
+     * 0 = nothing decided yet, which is what makes the first one always go.
      *
      * Volatile because every cover push reads it off the push thread: a track change carries the
      * answer with it, which is what settles a switch the other process missed.
+     *
+     * The answer and its time are one long - bit 0 the answer, the rest the uptime it was decided
+     * at - because they are read as a pair by a push that is built on another thread. As two
+     * fields a decision landing between the reads would send one answer with another's time, and
+     * the time is what the wallpaper process uses to drop an answer older than the one in hand.
      */
-    private static volatile Boolean sBlurSent;
+    private static volatile long sBlurSent;
 
     /** Whether the cover should be frosted right now, for a push to carry over. */
     static boolean blurWanted() {
-        return Boolean.TRUE.equals(sBlurSent);
+        return (sBlurSent & 1L) != 0L;
+    }
+
+    /**
+     * Puts this process's answer, and when it was made, on a cover push.
+     *
+     * The push is built on the worker while the answer is decided on the main thread, so the
+     * answer a push reads can be one a tap has already replaced - and the push, being the slow
+     * half, arrives after the switch that replaced it. Without the time on it the wallpaper
+     * process has no way to tell which of the two is the newer answer and takes the last one to
+     * arrive: the cover comes in sharp under its lyrics and stays that way for the song, because
+     * both sides believe they agree. See WallpaperProbe.takeBlurDecision.
+     */
+    static void putBlurOn(Intent out) {
+        long state = sBlurSent;      // one read: the answer and its time travel together
+        out.putExtra("lyricblur", (state & 1L) != 0L);
+        out.putExtra("blurseq", state >>> 1);
+    }
+
+    /** Writes an answer down, timed on the clock both processes share, and answers with it. */
+    private static long setBlurSent(boolean on) {
+        sBlurSent = SystemClock.uptimeMillis() << 1 | (on ? 1L : 0L);
+        return sBlurSent;
     }
 
     private static boolean sDemo;
@@ -134,9 +186,17 @@ final class LockLyrics {
         return sLines;
     }
 
+    /**
+     * Whether the lyrics are wanted at all: the switch says so, and no tap has taken them away.
+     * A demo asks for them itself, whatever the switch says.
+     */
+    private static boolean wanted() {
+        return sEnabled && !sTapHidden || sDemo;
+    }
+
     /** Whether the view belongs in the keyguard right now. */
     static boolean wantsAttached() {
-        return (sEnabled || sDemo) && Main.coverModeOn();
+        return wanted() && Main.coverModeOn();
     }
 
     /**
@@ -149,20 +209,133 @@ final class LockLyrics {
      * now, so through the flight they follow it down instead.
      */
     static boolean wantsShown() {
-        if (!wantsAttached() || !Main.screenOnCached()) return false;
+        if (!wantsAttached()) return false;
         ClockCollapse.Phase p = ClockCollapse.phase();
-        return p == ClockCollapse.Phase.ON || p == ClockCollapse.Phase.ENTER;
+        if (p == ClockCollapse.Phase.ON || p == ClockCollapse.Phase.ENTER) {
+            return Main.screenOnCached();
+        }
+        return inHeldAod();
     }
 
-    /** The media card, looked up again only when the one we hold has left the window. */
+    /**
+     * The full-screen always-on display that kept cover mode's clock - the lock screen, dimmed.
+     *
+     * The lyrics belong to it for the same reason the clock does: it is this lock screen being
+     * shown, not the OEM's own doze, and both the clock's ink and the media card are still laid
+     * out for the lyrics to sit between. Only that one doze: with the clock handed back to the
+     * OEM there is nothing measured to sit under, and `inkBottomOnScreen()` says NaN.
+     *
+     * No switch of its own. The one that decides this is "keep the small clock in the full-screen
+     * AOD", which is what makes the doze this lock screen; where that is on, carrying the lyrics
+     * through is what the lock screen was showing.
+     */
+    static boolean inHeldAod() {
+        return ClockCollapse.aodHeld() && !Main.screenOnCached();
+    }
+
+    /**
+     * The media card, looked up again only when the one we hold has left the window.
+     *
+     * "Left the window" now includes "is not being shown": the card can be up in the tree and
+     * hidden for a whole song - see cardTopOnScreen() - and a card nobody can see is a card whose
+     * position nothing should be measured from, so the lookup is retried rather than held. What
+     * comes back is still whatever the tree holds, shown or not: describe() reports whether the
+     * card is up, and answering "none" there would lose the difference between "hidden" and
+     * "not there at all".
+     *
+     * The lookup is findLockScreenView rather than findSysuiView for the same reason: the id is
+     * declared by the media card and by both media island layouts, and the first match in the
+     * tree is only the card while no island copy is up.
+     */
     static View card() {
         View c = sCard;
-        if (c != null && c.isAttachedToWindow()) return c;
+        if (c != null && c.isShown() && c.isAttachedToWindow()) return c;
         long now = SystemClock.uptimeMillis();
-        if (now - sCardLookAt < 500L) return null;
+        if (now - sCardLookAt < 500L) return c;
         sCardLookAt = now;
-        sCard = Main.findSysuiView("mi_media_controls");
+        sCard = Main.findLockScreenView("mi_media_controls");
         return sCard;
+    }
+
+    /** The band stops above the card the lock screen is showing. */
+    private static final int BAND_LIVE = 0;
+    /** ... at the end of the block the card would have filled. */
+    private static final int BAND_SPACE = 1;
+    /** ... off the card fractions LockPreview.kt carries for a phone nothing was measured on. */
+    private static final int BAND_DEFAULT = 2;
+    /**
+     * The card's own share of the screen - the same two fractions the app's preview falls back to
+     * (LockPreview.kt's SAMPLE_CARD_T and SAMPLE_CARD_H), so that a phone which has never had a
+     * card measured puts the module's band and the app's preview in the same place.
+     */
+    private static final float CARD_TOP_FRACTION = 1700f / 2608f;
+    private static final float CARD_HEIGHT_FRACTION = 557f / 2608f;
+    /** Which of the three answered last; -1 until one has. */
+    private static volatile int sBandSrc = -1;
+
+    /**
+     * Where the band's lower edge sits on screen, in pixels.
+     *
+     * Above the card where there is a card to read, because that is the only reading that follows
+     * it through the cover morph. The case the other two routes exist for is a card that is not up
+     * at all: the lock screen's media card is hidden outright by HyperLight's music capsule, which
+     * hooks MiuiMediaHeaderView.setVisibility and rewrites the OEM's VISIBLE into GONE (measured
+     * 2026-09-21). The lyrics used to give up entirely there - the band could not be measured, so
+     * they never faded in and the lock screen showed no lyrics at all.
+     *
+     * With no card drawn there is nothing to stop above, so the band takes the block the card
+     * would have filled instead of reserving a place for something nobody is drawing. That block
+     * is the recorded rectangle's BOTTOM edge, not its top: it is the whole of the gap the user
+     * sees between the lyrics and the shortcut buttons once the capsule has moved the media
+     * elsewhere. The recorded rectangle lags - the card is not sampled while it is hidden, and
+     * onLockTap's notes record a reading of 1360 against a card actually at 1700 - so the route is
+     * logged and reported rather than passed off as a measurement.
+     *
+     * Nothing on record at all leaves the two fractions the app's preview uses.
+     */
+    static float bandBottomOnScreen() {
+        View c = card();
+        if (c != null && c.isShown() && c.isAttachedToWindow()) {
+            int[] loc = new int[2];
+            c.getLocationOnScreen(loc);
+            // Below the clock, like the card. Anything higher is the shade's copy or an island,
+            // and neither is what the band is measured against.
+            if (loc[1] >= Main.screenHeight() / 3) {
+                setBandSource(BAND_LIVE);
+                return loc[1];
+            }
+        }
+        float recorded = Main.sampledCardBottom();
+        if (!Float.isNaN(recorded)) {
+            setBandSource(BAND_SPACE);
+            return recorded;
+        }
+        setBandSource(BAND_DEFAULT);
+        return Main.screenHeight() * (CARD_TOP_FRACTION + CARD_HEIGHT_FRACTION);
+    }
+
+    /** Which route answered bandBottomOnScreen(), as something readable in a broadcast result. */
+    static String bandSource() {
+        switch (sBandSrc) {
+            case BAND_LIVE:
+                return "live";
+            case BAND_SPACE:
+                return "space";
+            case BAND_DEFAULT:
+                return "default";
+            default:
+                return "?";
+        }
+    }
+
+    /**
+     * Written once a frame from the band, so it only speaks when the answer changes: a card that
+     * stays hidden for the whole song would otherwise log its line with every pre-draw.
+     */
+    private static void setBandSource(int src) {
+        if (src == sBandSrc) return;
+        sBandSrc = src;
+        Xp.log(TAG + "band anchored to the " + bandSource() + " card position");
     }
 
     /** Where the singing is, extrapolated from the last position the session reported. */
@@ -359,16 +532,71 @@ final class LockLyrics {
         if (v != null) v.kick();
     }
 
+    /** The app's switch. The setting: it is written to the state file and the app reads it back. */
     static void setEnabled(boolean on, String key, MediaController c) {
         sEnabled = on;
+        // The switch is the master, so it takes the tap's answer with it. Switching the lyrics
+        // off and on again brings them back; without this, turning them on while a previous tap
+        // had hidden them would leave the lock screen on the cover with the switch saying on.
+        sTapHidden = false;
         Xp.log(TAG + "lyrics " + (on ? "on" : "off"));
+        show(on, key, c, "switched off");
+    }
+
+    /**
+     * The lock screen's two-finger tap: the cover and the lyrics, swapped for this look at the
+     * lock screen and nothing else. The switch and the file it is written to are not touched -
+     * writing them was the old behaviour, and it meant a tap that was not meant left the lyrics
+     * off the next time the phone was locked, which reads as the setting turning itself off.
+     *
+     * With the switch off the tap does nothing at all rather than turning the lyrics on: that
+     * would be the lock screen writing the app's setting, which is what it no longer does.
+     */
+    static void toggleByTap(String key, MediaController c) {
+        if (!sEnabled) return;
+        sTapHidden = !sTapHidden;
+        Xp.log(TAG + "two-finger tap: lyrics " + (sTapHidden ? "hidden" : "shown"));
+        show(!sTapHidden, key, c, "hidden by the two-finger tap");
+    }
+
+    /**
+     * Cover mode has come up again. The tap's answer was about the lock screen it was made on -
+     * hiding the cover's lyrics is not a decision about every lock screen after it - so it is
+     * dropped here and the switch speaks for the new one.
+     *
+     * fromTap is the one entry that is not a new one: the user tapped the cover away and tapped
+     * it back, which is the same look seen twice rather than a new one, so the answer made about
+     * it stands. Its lines are left dropped with it - showing them again is the two-finger tap's
+     * own job, and it asks for them then.
+     *
+     * Otherwise the lines are asked for again as well. Hiding dropped them, and with the track
+     * key unchanged nothing else would look them up until the next song, which would leave the
+     * lyrics off every lock screen until then.
+     */
+    static void newLook(String key, MediaController c, boolean fromTap) {
+        if (!sTapHidden) return;
+        if (fromTap) {
+            Xp.log(TAG + "back through a tap: the lyrics stay hidden");
+            return;
+        }
+        sTapHidden = false;
+        Xp.log(TAG + "a new lock screen: back to the switch");
+        show(true, key, c, "shown again");
+    }
+
+    /**
+     * The show/hide half, shared by the switch and the tap; they differ only in whether the
+     * answer is written down. Off is where the two part company in the log: the reason says
+     * which of them did it and one of them is a setting.
+     */
+    private static void show(boolean on, String key, MediaController c, String why) {
         if (on) {
             sKey = "";
             onTrack(key, c);
         } else if (!sDemo) {
             sGen++;
             sLoading = false;
-            setLines(Collections.<LyricLine>emptyList(), "switched off");
+            setLines(Collections.<LyricLine>emptyList(), why);
         }
         refresh();
     }
@@ -422,23 +650,42 @@ final class LockLyrics {
         LyricView v = sView;
         View c = Main.sContainer;
         View card = card();
-        return "enabled=" + sEnabled + " demo=" + sDemo + " key=" + sKey + " lines=" + sLines.size()
+        return "enabled=" + sEnabled + " tap=" + (sTapHidden ? "hidden" : "shown")
+                + " demo=" + sDemo + " key=" + sKey + " lines=" + sLines.size()
                 + " (" + sWhy + ") src=" + srcName(sSource)
                 + " sessionHasLyric=" + LyricSource.hasLyricInfo(sController)
                 + " pos=" + positionMs() + " playing=" + playing()
                 + " cover=" + Main.coverModeOn() + " screen=" + Main.screenOnCached()
-                + " phase=" + ClockCollapse.phase() + " cardP=" + Main.cardProgress()
+                // What the wallpaper process was last told, and when: the other side prints the
+                // answer it holds and when it was decided, so the two readings side by side say
+                // whether a switch was lost on the way rather than guessing at the cover.
+                + " blur=" + (blurWanted() ? "on" : "off") + "@" + (sBlurSent >>> 1)
+                + " phase=" + ClockCollapse.phase()
+                + " inAod=" + inHeldAod() + " held=" + ClockCollapse.aodHeld()
+                + " cardP=" + Main.cardProgress()
                 + " container=" + (c == null ? "none" : c.getAlpha() + "/shown=" + c.isShown())
                 + " card=" + (card == null ? "none" : "shown=" + card.isShown())
-                + " clockBottom=" + ClockCollapse.inkBottomOnScreen()
+                // Where the band's lower edge came from: live stops above the card, space fills
+                // the block it would have taken (what happens while the music capsule hides it),
+                // default is the fractions. A hidden card is visible in this line as the route
+                // the lyrics are being placed on rather than as a missing reading.
+                + " bandSrc=" + bandSource()
+                + " clockBottom=" + ClockCollapse.contentBottomOnScreen()
+                + " ink=" + ClockCollapse.inkBottomOnScreen()
                 + " shown=" + wantsShown() + " tick=" + sTicking
                 + " view={" + (v == null ? "none" : v.describe()) + "}";
     }
 
-    /** The wallpaper process restarted, or may have: tell it again. */
+    /**
+     * The wallpaper process restarted, or may have: tell it again.
+     *
+     * Told again rather than forgotten: the answer is still the answer, and this only skips the
+     * "already sent that" short circuit below. What it must not do is make the answer look older
+     * than the last one it gave - the other side drops those - so the clock it is timed on runs
+     * on from here like any other decision.
+     */
     static void resendBlur() {
-        sBlurSent = null;
-        updateBlur();
+        updateBlur(true);
     }
 
     /**
@@ -446,19 +693,26 @@ final class LockLyrics {
      *
      * Held through a track change's lookup rather than dropped and re-applied, which would pulse
      * the cover sharp and back on every song. Nothing is sent while cover mode is off: leaving
-     * it fades the cover out whole, and the wallpaper process clears the blur with it.
+     * it fades the cover out whole, and the wallpaper process clears the blur with it. The
+     * decision itself is written down either way, because a cover push carries it.
      */
     private static void updateBlur() {
+        updateBlur(false);
+    }
+
+    /** again = tell the other side even when the answer has not changed. */
+    private static void updateBlur(boolean again) {
         if (!Main.coverModeOn()) {
-            sBlurSent = Boolean.FALSE;
+            setBlurSent(false);
             return;
         }
-        boolean on = sEnabled || sDemo;
-        boolean want = on && (!sLines.isEmpty() || (sLoading && Boolean.TRUE.equals(sBlurSent)));
-        if (sBlurSent != null && sBlurSent == want) return;
-        sBlurSent = want;
-        Main.sendToWallpaper("lyricblur", want);
-        Xp.log(TAG + "cover blur " + (want ? "on" : "off"));
+        boolean on = wanted();
+        boolean want = on && (!sLines.isEmpty() || (sLoading && blurWanted()));
+        long cur = sBlurSent;
+        if (!again && cur != 0L && ((cur & 1L) != 0L) == want) return;
+        long state = setBlurSent(want);
+        Main.sendToWallpaper("lyricblur", want, state >>> 1);
+        Xp.log(TAG + "cover blur " + (want ? "on" : "off") + (again ? " (told again)" : ""));
     }
 
     // ------------------------------------------------------------------ internals
@@ -510,7 +764,7 @@ final class LockLyrics {
             long delay = 1000L;
             holdScreen(v);
             updateHdr();
-            if (Main.screenOnCached() && !sLines.isEmpty()) {
+            if ((Main.screenOnCached() || inHeldAod()) && !sLines.isEmpty()) {
                 readState(false);
                 v.kick();
                 if (playing()) {
@@ -537,7 +791,13 @@ final class LockLyrics {
      * lock outranks a user activity timeout. Nothing is faked as a touch.
      */
     private static void holdScreen(LyricView v) {
-        boolean want = sKeepOn && wantsShown() && !sLines.isEmpty() && playing();
+        // NOT in a doze, and this is the one that has to be got right: setKeepScreenOn on this
+        // view is the whole mechanism above, and the view is in the SHADE window - so asking for
+        // it while the display is dozing takes a screen wake lock and pulls the phone out of the
+        // AOD at full brightness. Called from the tick, which never stops, so this would have
+        // fired within a second of the screen going off.
+        boolean want = sKeepOn && wantsShown() && !inHeldAod()
+                && !sLines.isEmpty() && playing();
         if (want == sHolding) return;
         sHolding = want;
         v.setKeepScreenOn(want);
@@ -551,7 +811,10 @@ final class LockLyrics {
 
     /** Whether the singing words should be drawn in HDR right now. */
     static boolean hdrWanted() {
-        return sHdr && sGlowing && wantsShown() && !sLines.isEmpty();
+        // Never in a doze: the colour mode is the whole shade window's and the headroom is 4x,
+        // which is the opposite of what a display that has just dimmed itself wants. The glow
+        // that arms this needs the lyrics on screen, so without this the AOD would ask for HDR.
+        return sHdr && sGlowing && wantsShown() && !inHeldAod() && !sLines.isEmpty();
     }
 
     private static boolean sGlowing;

@@ -86,12 +86,11 @@ fun AboutPageContent(
     openLicensePage: () -> Unit,
     openCreditsPage: () -> Unit,
     isBlurEnabled: Boolean = true,
-    checkUpdate: Boolean = true,
     isCurrent: () -> Boolean = { true },
 ) {
     // Owns the check, the install and the four dialogs; see UpdateUi.kt. It has to sit above the
     // Scaffold because the dialogs open their own windows and cannot be nested in the page body.
-    val update = rememberUpdateController(isCurrent, checkUpdate)
+    val update = rememberUpdateController(isCurrent)
     val topAppBarScrollBehavior = MiuixScrollBehavior()
     val lazyListState = rememberLazyListState()
 
@@ -393,9 +392,9 @@ private fun AboutContent(
                         ),
                     ) {
                         ArrowPreference(
-                            title = stringResource(R.string.license_apache),
-                            summary = stringResource(R.string.license_apache_summary),
-                            onClick = { uriHandler.openUri("https://www.apache.org/licenses/LICENSE-2.0.txt") },
+                            title = stringResource(R.string.license_agpl),
+                            summary = stringResource(R.string.license_agpl_summary),
+                            onClick = { uriHandler.openUri("https://www.gnu.org/licenses/agpl-3.0.txt") },
                         )
                         ArrowPreference(
                             title = stringResource(R.string.about_dependencies),
