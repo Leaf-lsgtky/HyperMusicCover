@@ -3,10 +3,6 @@ package com.os4.musiccover;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.net.URLEncoder;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -59,7 +55,7 @@ final class NcmLyrics {
      * apart; a window of thirty would not, and would hand the lock screen a live take's timings
      * over a studio recording.
      */
-    private static final long DURATION_SLACK_MS = 3000L;
+    static final long DURATION_SLACK_MS = 3000L;
 
     /**
      * The window for a candidate that is on the session's own album, which is a wider one.
@@ -79,7 +75,7 @@ final class NcmLyrics {
      * whose album matches gets six seconds and a candidate whose album does not is left where it
      * was, still bounded by the window that was measured against real takes of real songs.
      */
-    private static final long SAME_ALBUM_SLACK_MS = 6000L;
+    static final long SAME_ALBUM_SLACK_MS = 6000L;
 
     /** What the session says about the song, reduced to the four things a match can use. */
     static final class Query {
@@ -253,18 +249,223 @@ final class NcmLyrics {
         } catch (Throwable t) {
             Xp.log("[MCNcm] failed: " + t);
         }
-        // A thrown request is not cached: the next attempt may be on a working network, and
-        // caching the network's bad minute as "this song has no lyrics" would outlast it.
-        if (got != null || !networkFailed) {
+        if (got != null) {
             synchronized (CACHE) {
-                CACHE.put(key, got == null ? NONE : got);
+                CACHE.put(key, got);
             }
+            return got;
+        }
+        // Nothing found - and whether that is worth remembering depends on why.
+        //
+        // A thrown request is not cached: the next attempt may be on a working network, and
+        // caching the network's bad minute as "this song has no lyrics" would outlast it. A
+        // search that answered with a page of wrong songs is the same mistake wearing a better
+        // disguise - it looks exactly like an honest miss from here, and costs the song its
+        // lyrics for the whole play. One extra request, once every half minute at most, buys
+        // the difference. See searchIsHonest().
+        if (networkFailed) {
+            return null;
+        }
+        if (!searchIsHonest()) {
+            Xp.log("[MCNcm] not remembering the miss for " + q + ": the search is not answering "
+                    + "honestly right now");
+            return null;
+        }
+        synchronized (CACHE) {
+            CACHE.put(key, NONE);
         }
         return got;
     }
 
     /** Set by the last request to fail on the network rather than on its answer. */
     private static volatile boolean networkFailed;
+
+    /**
+     * Whether the search is answering honestly, asked only when it matters.
+     *
+     * The endpoint's answer to being searched too much is not an error but a page of plausible
+     * wrong songs: covers with the right title, instrumentals, other artists' songs of the same
+     * name - everything except the recording asked for. From here that is indistinguishable from
+     * a song the catalogue does not have, and the two want opposite treatment. A song that is
+     * genuinely absent should be remembered as absent, or every screen-on spends the round trip
+     * again; a song hidden by a bad minute must NOT be, because the minute passes and the miss
+     * outlives it - cached per track, one bad minute costs that song its lyrics for the whole
+     * play.
+     *
+     * So the question is put to a song whose right answer is known. 七里香 is on the service and
+     * its id is 186001; a search that does not return it is not telling the truth, whatever it
+     * says about anything else. Measured 2026-09-22: in this state the search for it answered
+     * with ten covers, a music box version and two "pop beat" backing tracks, while the lyric
+     * endpoint handed over the real thing by id without complaint - the block is on searching,
+     * not on the catalogue.
+     *
+     * Written as escapes rather than characters because the build sets no source encoding.
+     */
+    private static final String HEALTH_TERMS = "七里香 周杰伦";
+    private static final String HEALTH_ID = "186001";
+    /** A wider page than the lookups use: honest or not, the answer is somewhere in the list. */
+    private static final String HEALTH_SEARCH =
+            "https://music.163.com/api/search/get?s=%s&type=1&limit=30";
+
+    /**
+     * How long one answer about the endpoint's honesty stands.
+     *
+     * Long enough that a run of misses costs one extra request rather than one each, short
+     * enough to follow the state changing - it clears on its own, and has taken anywhere from a
+     * few minutes to over forty.
+     */
+    private static final long HEALTH_TTL_MS = 30000L;
+    private static volatile long healthAt;
+    private static volatile boolean healthy = true;
+
+    /** True when the search can be believed - including when we could not find out. */
+    private static boolean searchIsHonest() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (healthAt != 0L && now - healthAt < HEALTH_TTL_MS) {
+            return healthy;
+        }
+        boolean ok = askHealth();
+        healthy = ok;
+        healthAt = now;
+        return ok;
+    }
+
+    private static boolean askHealth() {
+        try {
+            String json = get(String.format(HEALTH_SEARCH,
+                    URLEncoder.encode(HEALTH_TERMS, "UTF-8")));
+            // A request that did not arrive says nothing about honesty, and answering "lying"
+            // to it would stop every miss being remembered for as long as the network is down.
+            if (json == null) {
+                return true;
+            }
+            org.json.JSONArray songs = new org.json.JSONObject(json).getJSONObject("result")
+                    .getJSONArray("songs");
+            for (int i = 0; i < songs.length(); i++) {
+                // Compared as an id, not as text anywhere in the body: the same digits turn up
+                // as a duration and as other songs' ids, and a substring test would call a page
+                // of decoys honest.
+                if (HEALTH_ID.equals(String.valueOf(songs.getJSONObject(i).optLong("id")))) {
+                    return true;
+                }
+            }
+            Xp.log("[MCNcm] the search is serving decoys: " + HEALTH_TERMS + " came back without "
+                    + HEALTH_ID + " in " + songs.length() + " results");
+            return false;
+        } catch (Throwable t) {
+            // Same argument as a null body: not knowing is not evidence of lying.
+            Xp.log("[MCNcm] could not check the search's honesty: " + t);
+            return true;
+        }
+    }
+
+    /**
+     * The search response for one set of terms, so it can be fetched before it is needed.
+     *
+     * This is the half of the lookup that can be done early, and the only one. The search takes
+     * the song's name and its first artist and nothing else - see terms() - which is exactly what
+     * a play queue's item carries, while the choosing below needs the duration, which no queue
+     * here publishes. So the prefetch asks the question and the real lookup, which by then has
+     * the duration, answers it: the matching runs at full strength on results that are already
+     * in hand. Nothing about which song gets picked changes; only when the bytes arrived does.
+     *
+     * Two minutes because that is far longer than the gap it exists to cover - a track starting
+     * after the queue said it would - and short enough that a spell of the endpoint answering
+     * with unrelated songs cannot be held over a song for long. See the re-ask in fetch().
+     */
+    private static final int SEARCH_CACHE_MAX = 8;
+    private static final long SEARCH_TTL_MS = 120000L;
+
+    private static final class Searched {
+        final String json;
+        final long at;
+
+        Searched(String json, long at) {
+            this.json = json;
+            this.at = at;
+        }
+    }
+
+    private static final Map<String, Searched> SEARCHES =
+            new LinkedHashMap<String, Searched>(SEARCH_CACHE_MAX + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Searched> eldest) {
+                    return size() > SEARCH_CACHE_MAX;
+                }
+            };
+
+    /** The search response for these terms, from the prefetch if it got there first. */
+    private static String search(String terms, String url) throws Exception {
+        synchronized (SEARCHES) {
+            Searched s = SEARCHES.get(terms);
+            if (s != null && android.os.SystemClock.uptimeMillis() - s.at < SEARCH_TTL_MS) {
+                Xp.log("[MCNcm] search for \"" + terms + "\" was already done");
+                return s.json;
+            }
+        }
+        String json = get(url);
+        if (json != null) {
+            synchronized (SEARCHES) {
+                SEARCHES.put(terms, new Searched(json, android.os.SystemClock.uptimeMillis()));
+            }
+        }
+        return json;
+    }
+
+    private static void forgetSearch(String terms) {
+        synchronized (SEARCHES) {
+            SEARCHES.remove(terms);
+        }
+    }
+
+    /**
+     * Runs the search for a track that has not started yet, and keeps the answer.
+     *
+     * Takes the two fields rather than a Query because a prefetch has no duration to build one
+     * with - and needs none, which is the whole reason this half can be done early. Blocking;
+     * the caller is a prefetch thread.
+     */
+    static void warmSearch(String title, String artist) {
+        try {
+            Query q = build(title, artist, null, 0L);
+            if (q == null) {
+                return;
+            }
+            String terms = terms(q);
+            if (terms.isEmpty()) {
+                return;
+            }
+            synchronized (SEARCHES) {
+                Searched s = SEARCHES.get(terms);
+                if (s != null && android.os.SystemClock.uptimeMillis() - s.at < SEARCH_TTL_MS) {
+                    return;
+                }
+            }
+            long t0 = android.os.SystemClock.uptimeMillis();
+            String json = get(String.format(SEARCH, URLEncoder.encode(terms, "UTF-8")));
+            if (json == null) {
+                return;
+            }
+            synchronized (SEARCHES) {
+                SEARCHES.put(terms, new Searched(json, android.os.SystemClock.uptimeMillis()));
+            }
+            Xp.log("[MCNcm] searched \"" + terms + "\" ahead of time in "
+                    + (android.os.SystemClock.uptimeMillis() - t0) + "ms");
+        } catch (Throwable t) {
+            Xp.log("[MCNcm] searching ahead failed: " + t);
+        }
+    }
+
+    /** For op queue: whether reading ahead has anything in hand, and who we last thought we were
+     * talking to. The honesty is reported as last decided, never asked for here - a diagnostic
+     * that sends a request of its own would be one more request against the thing it is
+     * measuring. "unknown" means nothing has missed yet, which is the healthy case. */
+    static String describeSearches() {
+        synchronized (SEARCHES) {
+            return "searches=" + SEARCHES.size() + " honest="
+                    + (healthAt == 0L ? "unknown" : String.valueOf(healthy));
+        }
+    }
 
     private static Found fetch(Query q) throws Exception {
         networkFailed = false;
@@ -274,7 +475,7 @@ final class NcmLyrics {
         }
         long started = android.os.SystemClock.uptimeMillis();
         String url = String.format(SEARCH, URLEncoder.encode(terms, "UTF-8"));
-        String json = get(url);
+        String json = search(terms, url);
         if (json == null) {
             return null;
         }
@@ -287,6 +488,11 @@ final class NcmLyrics {
         // with it a song that genuinely is not there costs one extra request, once.
         if (id == null && q.durationMs > 0 && !norm(q.title).isEmpty()) {
             Xp.log("[MCNcm] nothing in the results for " + q + "; asking again");
+            // get, not search: the point of asking again is to get a DIFFERENT answer, and a
+            // cached one is the same answer by definition. The entry goes too - whatever it
+            // holds has just been shown to prove nothing, and leaving it would hand the same
+            // uselessness to the next lookup that searches these terms.
+            forgetSearch(terms);
             json = get(url);
             if (json == null) {
                 return null;
@@ -299,6 +505,11 @@ final class NcmLyrics {
             id = byAlbum(q);
         }
         if (id == null) {
+            // Whatever is held for these terms has now been shown to prove nothing, by every
+            // route. Dropping it matters most in the case it is hardest to see: a page of
+            // decoys kept for the two minutes this cache runs would hand the same page to the
+            // read-ahead and to every other song that searches the same terms.
+            forgetSearch(terms);
             Xp.log("[MCNcm] nothing matched " + q + " (searched \"" + terms
                     + "\", and its album)");
             return null;
@@ -343,7 +554,7 @@ final class NcmLyrics {
      * that parses to nothing, and because the answer is cached per track, the song played out
      * with no lyrics at all. Measured against the live response on the device, not reasoned.
      */
-    private static String str(org.json.JSONObject o, String key) {
+    static String str(org.json.JSONObject o, String key) {
         Object v = o.opt(key);
         if (!(v instanceof String)) {
             return null;
@@ -353,7 +564,7 @@ final class NcmLyrics {
     }
 
     /** Title and artist, which is what the search endpoint ranks on. */
-    private static String terms(Query q) {
+    static String terms(Query q) {
         return joined(q.title, firstArtist(q.artist));
     }
 
@@ -377,7 +588,7 @@ final class NcmLyrics {
      * ranks on the primary artist anyway. Whether a result is by this artist is a different
      * question and is asked of the whole string - see byArtist.
      */
-    private static String firstArtist(String artist) {
+    static String firstArtist(String artist) {
         int slash = artist.indexOf('/');
         return (slash > 0 ? artist.substring(0, slash) : artist).trim();
     }
@@ -573,7 +784,7 @@ final class NcmLyrics {
      * Asked of titles and of album names alike, which are the same problem: one name typed by two
      * catalogues.
      */
-    private static int nameScore(String wanted, String got) {
+    static int nameScore(String wanted, String got) {
         if (got.isEmpty()) {
             return 0;
         }
@@ -631,7 +842,7 @@ final class NcmLyrics {
      *
      * The script is the other thing that varies, and it is folded first - see folded().
      */
-    private static String norm(String s) {
+    static String norm(String s) {
         if (s == null) {
             return "";
         }
@@ -690,55 +901,19 @@ final class NcmLyrics {
     }
 
     /**
-     * One GET, with the connection left open for the next.
+     * One GET, and the record of whether it arrived.
      *
-     * disconnect() is deliberately not called: both requests here go to the same host, and
-     * leaving the connection in the keep-alive pool is what makes the second one cost 48-66ms
-     * instead of the ~250ms the first one does. The saving is the DNS lookup, the TCP handshake
-     * and the TLS handshake, measured at ~50ms of TLS alone on this device.
+     * The request itself is Http's, which is where the connection handling lives now that a
+     * second by-name route asks other catalogues the same way. What stays here is the one thing
+     * that is this route's own: a request that did not arrive must not be remembered as a song
+     * without lyrics. See load().
      */
     private static String get(String url) throws Exception {
-        long started = android.os.SystemClock.uptimeMillis();
-        HttpURLConnection conn = null;
-        try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(4000);
-            conn.setReadTimeout(6000);
-            conn.setRequestProperty("User-Agent", "HyperMusicCover");
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                Xp.log("[MCNcm] HTTP " + code + " in "
-                        + (android.os.SystemClock.uptimeMillis() - started) + "ms");
-                networkFailed = true;
-                return null;
-            }
-            return read(conn.getInputStream());
-        } catch (Throwable t) {
-            Xp.log("[MCNcm] request failed after "
-                    + (android.os.SystemClock.uptimeMillis() - started) + "ms: " + t);
+        Http.Reply r = Http.get(url, "MCNcm");
+        if (!r.ok()) {
             networkFailed = true;
-            // Only a connection that failed is torn down; a healthy one stays pooled.
-            if (conn != null) {
-                try {
-                    conn.disconnect();
-                } catch (Throwable ignored) {
-                }
-            }
-            return null;
         }
-    }
-
-    private static String read(InputStream in) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(32768);
-        byte[] buf = new byte[8192];
-        int n;
-        while ((n = in.read(buf)) > 0) {
-            out.write(buf, 0, n);
-        }
-        // Read to the end and closed, not disconnected: that is the condition for the socket to
-        // go back to the pool rather than be thrown away.
-        in.close();
-        return new String(out.toByteArray(), "UTF-8");
+        return r.body;
     }
 
     /**

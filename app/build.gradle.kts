@@ -72,6 +72,15 @@ android {
         }
     }
 
+    // Pinned, not left to the platform default. NcmLyrics' health check compares against a
+    // song title written as characters, and a javac that read this file as the system codepage
+    // would hand it a mangled one - the search would then never find the id it looks for, the
+    // endpoint would look permanently dishonest, and no miss would ever be cached again. It
+    // builds correctly here only because this toolchain's javac already defaults to UTF-8.
+    tasks.withType<JavaCompile>().configureEach {
+        options.encoding = "UTF-8"
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

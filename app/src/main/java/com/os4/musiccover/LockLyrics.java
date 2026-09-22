@@ -434,19 +434,38 @@ final class LockLyrics {
             // when it does, which is the point of the key - so without this, the lyric a module
             // just went and fetched would sit on the session unread for the whole song, and
             // whatever we settled for in the first second would stand.
-            if (sEnabled && !key.isEmpty() && sSource != LyricSource.SRC_LYRIC_INFO
-                    && !sLoading && LyricSource.hasLyricInfo(c)) {
-                Xp.log(TAG + "the session now carries its own lyric; re-reading " + key);
+            //
+            // The question is "is the session carrying a payload this song has not been read
+            // against", not "did we settle for something worse than the session's own". The
+            // second one cannot be asked of the case it most needs to catch: a payload read
+            // during the track change belongs to the song before it as often as not, and once
+            // one of those has been recorded as the session's own lyric, a gate that only fires
+            // when the source is something else can never replace it. Asking after the payload
+            // instead both fires for that and cannot loop, because each payload is tried once.
+            String info = sEnabled && !key.isEmpty() && !sLoading ? LyricSource.infoFor(c) : null;
+            if (info != null && !info.equals(sInfoSeen) && LyricSource.usable(info)
+                    && sInfoTries < MAX_INFO_TRIES) {
+                sInfoSeen = info;
+                sInfoTries++;
+                Xp.log(TAG + "the session is carrying a lyric " + key
+                        + " has not been read against; re-reading (" + sInfoTries + ")");
                 CACHE.remove(key);
-                sKey = "";
-            } else {
+                // The lines already up are NOT cleared. A re-read is looking for something
+                // better than what is on screen, and the first version emptied the view before
+                // it knew whether there was any: a re-read that came back with nothing left the
+                // song with no lyrics at all for the rest of its play. lookup() keeps them.
+                lookup(key, c, true);
                 return;
             }
+            return;
         }
         sKey = key;
         sTrackChangedAt = SystemClock.uptimeMillis();
         sBlurVideoReloaded = false;
         if (sEnabled && !key.isEmpty()) scheduleBlurKick(BLUR_ENTER_DELAY_MS + 16L);
+        // A different song: the budget above is per track, and so is the payload it was spent on.
+        sInfoSeen = null;
+        sInfoTries = 0;
         // The previous song's route says nothing about this one, and leaving it set would let a
         // track that follows a session-lyric track skip the upgrade check entirely.
         sSource = LyricSource.SRC_NONE;
@@ -468,7 +487,29 @@ final class LockLyrics {
             setLines(hit.lines, "cached");
             return;
         }
-        final String want = key;
+        // What the lookup about to start will read the session as, so a payload that turns up
+        // after it - the provider module's real one - can be told apart from this one.
+        sInfoSeen = LyricSource.infoFor(c);
+        lookup(key, c, false);
+    }
+
+    /** How many times one song may be re-read because the session published something new. */
+    private static final int MAX_INFO_TRIES = 3;
+    /** The payload the lookup for sKey was started against, so the next one can be recognised. */
+    private static String sInfoSeen;
+    /** How much of MAX_INFO_TRIES this song has spent. */
+    private static int sInfoTries;
+
+    /**
+     * Starts the lookup for `key` and puts whatever it finds on screen.
+     *
+     * `keepCurrent` is the whole difference between the two callers. A track change has already
+     * emptied the view, so anything found is an improvement on nothing and an empty answer costs
+     * nothing to apply. A re-read is looking for something better than what is already up, and
+     * an empty answer there must not be applied at all - the lines on screen are the best that
+     * has been found for this song and there is nothing to replace them with.
+     */
+    private static void lookup(final String want, MediaController c, final boolean keepCurrent) {
         final int gen = ++sGen;
         sLoading = true;
         LyricSource.load(c, new LyricSource.Callback() {
@@ -479,6 +520,14 @@ final class LockLyrics {
                     return;
                 }
                 sLoading = false;
+                if (lines.isEmpty() && keepCurrent) {
+                    Xp.log(TAG + "the re-read found nothing (" + why + "); keeping the "
+                            + sLines.size() + " lines already up");
+                    // Not setLines: the lines have not changed. The blur still has to be told,
+                    // because sLoading was what was holding it across the lookup.
+                    refresh();
+                    return;
+                }
                 sSource = source;
                 // What the LAST lookup found, not what any lookup ever found.
                 //
@@ -490,8 +539,7 @@ final class LockLyrics {
                 // SRC_NONE is deliberately not an answer either way: finding nothing can mean
                 // the network was down or the song simply has no lyrics anywhere, neither of
                 // which says anything about the provider.
-                if (source == LyricSource.SRC_LYRIC_INFO || source == LyricSource.SRC_DATABASE
-                        || source == LyricSource.SRC_NETEASE) {
+                if (source != LyricSource.SRC_NONE) {
                     boolean fromSession = source == LyricSource.SRC_LYRIC_INFO;
                     if (fromSession != sSawSessionLyric) {
                         sSawSessionLyric = fromSession;
@@ -702,6 +750,10 @@ final class LockLyrics {
                 return "amll";
             case LyricSource.SRC_NETEASE:
                 return "netease";
+            case LyricSource.SRC_KUGOU:
+                return "kugou";
+            case LyricSource.SRC_LRCLIB:
+                return "lrclib";
             default:
                 return "none";
         }
@@ -789,8 +841,8 @@ final class LockLyrics {
             sTrackChangedAt = 0L;
             sBlurVideoReloaded = false;
         }
-        Main.sendToWallpaper("lyricblur", want, state >>> 1);
-        Main.updateVideoCoverBlur(want);
+        CoverPush.sendToWallpaper("lyricblur", want, state >>> 1);
+        CoverPush.updateVideoCoverBlur(want);
         Xp.log(TAG + "cover blur " + (want ? "on" : "off") + (again ? " (told again)" : ""));
     }
 

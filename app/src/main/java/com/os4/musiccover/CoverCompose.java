@@ -8,7 +8,7 @@ import android.graphics.Bitmap;
  * Lives on its own so the wallpaper process can call it without touching Main, whose static
  * state belongs to SystemUI. Pure: the same source, size and bias give the same pixels in
  * either process, which is what lets SystemUI hand over the small source instead of the
- * composed picture - see Main.pushArtToWallpaper().
+ * composed picture - see CoverPush.pushArtToWallpaper().
  */
 final class CoverCompose {
 

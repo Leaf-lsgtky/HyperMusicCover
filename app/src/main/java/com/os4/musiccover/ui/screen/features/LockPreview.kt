@@ -356,7 +356,7 @@ private fun DrawScope.drawShot(shot: ModuleBridge.Shot?, k: Float) {
 /**
  * The cover layout, drawn small.
  *
- * This is Main.composeWallpaper() written a second time, and that is a real cost: one layout
+ * This is CoverPush.composeWallpaper() written a second time, and that is a real cost: one layout
  * with two implementations can drift, and if it does, the phone is right and this is wrong. It
  * is worth it because the alternative - having SystemUI compose a full screen and ship the
  * result back for every frame of a slider drag - cannot keep up with a finger.

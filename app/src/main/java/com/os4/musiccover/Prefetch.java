@@ -55,18 +55,32 @@ final class Prefetch {
     /** Artwork is ~1MB decoded; this is a handful of tracks, not a library. */
     private static final int CACHE_MAX = 6;
 
-    /** One queue item, reduced to what a cover needs. */
+    /** One queue item, reduced to what a cover and a lyric lookup need. */
     private static final class Item {
         final long id;
         final String title;
         final Uri icon;
+        /** The platform's own song id, which is what the lyric database is keyed by. */
+        final String mediaId;
+        /**
+         * The other half of a lyric search. Only the artist, because the search takes the song's
+         * name and its first artist and nothing else - the album and the duration that the rest
+         * of a by-name lookup wants are not needed until the choosing, which happens later and
+         * elsewhere. See NcmLyrics.terms().
+         */
+        final String artist;
 
-        Item(long id, String title, Uri icon) {
+        Item(long id, String title, Uri icon, String mediaId, String artist) {
             this.id = id;
             this.title = title;
             this.icon = icon;
+            this.mediaId = mediaId;
+            this.artist = artist;
         }
     }
+
+    /** Which player the queue belongs to; the lyric half is only run for one of them. */
+    private static volatile String sPkg;
 
     private static volatile List<Item> sItems = new ArrayList<>();
     /** Where the player says it is in that list, or -1 when it does not say. */
@@ -117,6 +131,7 @@ final class Prefetch {
                 try {
                     readQueue(c);
                     fetchAround();
+                    warmLyricAhead();
                 } catch (Throwable t) {
                     Xp.log(TAG + "queue read failed: " + t);
                 }
@@ -153,13 +168,16 @@ final class Prefetch {
         sPredicted = it.title;
         sPredictedAt = SystemClock.uptimeMillis();
         Xp.log(TAG + "predicting \"" + it.title + "\" for a skip " + (dir < 0 ? "back" : "on"));
-        // The one after this one is now worth having.
+        // The one after this one is now worth having. sIndex has already moved, so this reads
+        // ahead of where the press is landing rather than of where the player still thinks it is
+        // - which is the whole 0.8s the press is caught before the player reports it.
         work().post(new Runnable() {
             @Override
             public void run() {
                 fetchAround();
             }
         });
+        warmLyricAhead();
         return b;
     }
 
@@ -187,12 +205,16 @@ final class Prefetch {
             n = CACHE.size();
         }
         return "queue=" + items.size() + " at=" + sIndex + " cached=" + n
-                + " predicted=" + sPredicted;
+                + " predicted=" + sPredicted
+                // What reading ahead has in hand. The module's own log cannot be read back on
+                // this device, so this line is the only place the lyric prefetch is visible.
+                + " " + NcmLyrics.describeSearches() + " " + LyricSource.describeWarm();
     }
 
     // ------------------------------------------------------------------ internals
 
     private static void readQueue(MediaController c) {
+        sPkg = c.getPackageName();
         List<MediaSession.QueueItem> q = c.getQueue();
         if (q == null || q.isEmpty()) {
             sItems = new ArrayList<>();
@@ -204,7 +226,9 @@ final class Prefetch {
             MediaDescription d = qi.getDescription();
             items.add(new Item(qi.getQueueId(),
                     d == null || d.getTitle() == null ? null : d.getTitle().toString(),
-                    d == null ? null : d.getIconUri()));
+                    d == null ? null : d.getIconUri(),
+                    d == null ? null : d.getMediaId(),
+                    str(d == null ? null : d.getSubtitle())));
         }
         long active = -1L;
         PlaybackState ps = c.getPlaybackState();
@@ -218,6 +242,76 @@ final class Prefetch {
         }
         sItems = items;
         sIndex = at;
+    }
+
+    private static String str(CharSequence cs) {
+        return cs == null ? null : cs.toString();
+    }
+
+    /**
+     * The lyric for the track after this one, fetched into the caches the real lookup reads.
+     *
+     * One ahead, where the artwork takes two either side. The cases are not the same shape: a
+     * cover has to be right the instant a press lands, and two presses in a burst is what that
+     * reach exists for, where nobody reads the lyrics of a song they skipped past in a second.
+     * Going only forward and only one deep also keeps the request rate close to what it was,
+     * which matters for the by-name half - NetEase answers a client it has decided is searching
+     * too much by quietly leaving the right song out of the results.
+     *
+     * Apple Music only, which is not a limitation so much as a description: it is the one player
+     * here that publishes a queue at all (measured 2026-09-17 - NetEase, Salt and Bilibili all
+     * answer "no queue"), so for everyone else there is nothing to read ahead from.
+     */
+    private static void warmLyricAhead() {
+        String pkg = sPkg;
+        if (pkg == null || !pkg.contains("apple")) return;
+        List<Item> items = sItems;
+        int at = sIndex;
+        if (items.isEmpty() || at < 0 || at + 1 >= items.size()) return;
+        final Item it = items.get(at + 1);
+        final String dir = LyricSource.dirForPackage(pkg);
+        // Apple's queue items carry the title, the artist and the platform id, and no duration
+        // anywhere - the extras hold thirty of the player's own keys and not that one (measured
+        // 2026-09-22 with `op queue`). So the by-name half is asked for only as far as a
+        // duration is not needed, which is exactly as far as the search: NcmLyrics.warmSearch
+        // runs it and keeps the results, and the real lookup does the choosing once the session
+        // has told it how long the track is.
+        final boolean byName = it.title != null && !it.title.isEmpty()
+                && it.artist != null && !it.artist.isEmpty();
+        if (it.mediaId == null && !byName) return;
+        lyricWork().post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Xp.log(TAG + "reading ahead for \"" + it.title + "\" (id=" + it.mediaId
+                            + (byName ? ", searching \"" + it.artist + "\"" : ", no name search")
+                            + ")");
+                    LyricSource.warm(it.mediaId, dir, byName ? it.title : null,
+                            byName ? it.artist : null);
+                } catch (Throwable t) {
+                    Xp.log(TAG + "reading ahead failed: " + t);
+                }
+            }
+        });
+    }
+
+    /**
+     * Its own thread, not the artwork's.
+     *
+     * The mirrors are allowed seconds and the by-name search is three round trips, and the
+     * artwork prefetch is what makes a press answerable at all - sharing one thread would put
+     * the cover behind the lyric of a song that has not started.
+     */
+    private static Handler sLyricWork;
+
+    private static synchronized Handler lyricWork() {
+        if (sLyricWork == null) {
+            HandlerThread t = new HandlerThread("mc-lyricahead",
+                    android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            t.start();
+            sLyricWork = new Handler(t.getLooper());
+        }
+        return sLyricWork;
     }
 
     /** Fetches the artwork either side of where we think we are, newest need first. */
