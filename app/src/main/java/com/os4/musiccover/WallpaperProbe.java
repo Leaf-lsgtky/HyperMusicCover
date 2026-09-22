@@ -1353,14 +1353,24 @@ public class WallpaperProbe {
 
     private static Bitmap sharpFittedArt() {
         Bitmap art = sArt;
-        if (art == null || sReportedW <= 0 || sReportedH <= 0) return null;
-        if (art.getWidth() == sReportedW && art.getHeight() == sReportedH) return art;
+        if (art == null) return null;
+        int targetW = sReportedW;
+        int targetH = sReportedH;
+        if (targetW <= 0 || targetH <= 0) {
+            Context ctx = sCtx;
+            if (ctx != null) {
+                targetW = ctx.getResources().getDisplayMetrics().widthPixels;
+                targetH = ctx.getResources().getDisplayMetrics().heightPixels;
+            }
+        }
+        if (targetW <= 0 || targetH <= 0) return null;
+        if (art.getWidth() == targetW && art.getHeight() == targetH) return art;
         Bitmap cached = sFitted;
         if (cached != null && sFittedOf == art
-                && cached.getWidth() == sReportedW && cached.getHeight() == sReportedH) {
+                && cached.getWidth() == targetW && cached.getHeight() == targetH) {
             return cached;
         }
-        Bitmap fitted = centerCrop(art, sReportedW, sReportedH);
+        Bitmap fitted = centerCrop(art, targetW, targetH);
         sFitted = fitted;
         sFittedOf = art;
         return fitted;
@@ -2072,8 +2082,13 @@ public class WallpaperProbe {
                                 sArt = null;
                                 sFitted = null;
                                 sFittedOf = null;
+                                sLyricBlur = false;
+                                sLyricBlurWant = false;
+                                dropFrosted();
                                 new File(c.getFilesDir(), ART_FILE).delete();
                                 new File(c.getFilesDir(), SRC_FILE).delete();
+                                new File(c.getFilesDir(), COVER_VIDEO_FILE).delete();
+                                new File(c.getFilesDir(), COVER_VIDEO_BLUR_FILE).delete();
                                 videoWindowTakeover(true);
                                 return;
                             }
@@ -2393,7 +2408,12 @@ public class WallpaperProbe {
                         Bitmap to = fittedArt();
                         Xp.log(TAG + "lyric blur " + (on ? "on" : "off") + " (waited "
                                 + (SystemClock.uptimeMillis() - t0) + "ms)");
-                        if (sArt == null || videoPath()) return;
+                        if (sArt == null) return;
+                        if (videoPath()) {
+                            sFadeFrom = from;
+                            videoWindowTakeover(false);
+                            return;
+                        }
                         if (from != null && to != null) startFade(from, to, null);
                         else reloadTexture();
                     }
@@ -2967,6 +2987,7 @@ public class WallpaperProbe {
     private static volatile String sCoverVideoPath;
     private static volatile long sCurrentArtChecksum;
     private static final String COVER_VIDEO_FILE = "mc_cover.mp4";
+    private static final String COVER_VIDEO_BLUR_FILE = "mc_cover_blur.mp4";
     private static final java.util.concurrent.ExecutorService sVideoWorker =
             java.util.concurrent.Executors.newSingleThreadExecutor();
 
@@ -3472,7 +3493,10 @@ public class WallpaperProbe {
                 Xp.log(TAG + "videoWindowTakeover: saved playback position: "
                         + (sSavedVideoPositionUs / 1000) + "ms");
             }
-            final long checksum = sCurrentArtChecksum;
+            final boolean lyricBlur = sLyricBlur;
+            final long checksum = sCurrentArtChecksum != 0
+                    ? (lyricBlur ? sCurrentArtChecksum ^ 0x55aa55aa55aa55aaL : sCurrentArtChecksum)
+                    : 0;
 
             // If phone is currently unlocked on desktop, do NOT reload desktop video!
             final boolean onDesktop = !sKeyguardShowing && isDesktopEngine(eng);
@@ -3492,13 +3516,20 @@ public class WallpaperProbe {
 
             sVideoWorker.submit(() -> {
                 try {
-                    File videoFile = new File(ctx.getFilesDir(), COVER_VIDEO_FILE);
+                    File videoFile = new File(ctx.getFilesDir(), lyricBlur ? COVER_VIDEO_BLUR_FILE : COVER_VIDEO_FILE);
                     int w = sReportedW > 0 ? sReportedW : ctx.getResources().getDisplayMetrics().widthPixels;
                     int h = sReportedH > 0 ? sReportedH : ctx.getResources().getDisplayMetrics().heightPixels;
                     int ew = (w / 2) * 2, eh = (h / 2) * 2;
                     // centerCrop always allocates, so this end is ours to give back - and it is a
                     // full-screen ARGB bitmap per track change, which the encoder does not own.
                     Bitmap to = centerCrop(art, ew, eh);
+                    if (lyricBlur) {
+                        Bitmap blurred = CoverCompose.frosted(to);
+                        if (blurred != to) {
+                            to.recycle();
+                            to = blurred;
+                        }
+                    }
 
                     // What the cover walks in from, in the order of what the eye is looking at:
                     // the cover of the track that is leaving, and failing that a frame of the
@@ -3510,6 +3541,10 @@ public class WallpaperProbe {
                     try {
                         if (sVideoFade && from == null) {
                             from = wallpaperFrame(eng, ew, eh);
+                            ownFrom = true;
+                        } else if (from != null && (from.getWidth() != ew || from.getHeight() != eh)) {
+                            Bitmap croppedFrom = centerCrop(from, ew, eh);
+                            from = croppedFrom;
                             ownFrom = true;
                         }
                         boolean ok = CoverVideoEncoder.encodeToMp4(from, to, videoFile, checksum,
@@ -3524,7 +3559,8 @@ public class WallpaperProbe {
                             } else {
                                 sCoverVideoActive = true;
                                 sCoverSuspended = false;
-                                Xp.log(TAG + "videoWindowTakeover: cover video ready (" + videoFile.length()
+                                Xp.log(TAG + "videoWindowTakeover: cover video (" + (lyricBlur ? "blur" : "sharp")
+                                        + ") ready (" + videoFile.length()
                                         + "B), triggering reload on " + eng.getClass().getSimpleName());
                                 triggerVideoReload(eng);
                             }

@@ -49,6 +49,7 @@ final class Xp {
      * way the old XposedBridge.log was, so `logcat | grep MCProbe` still works.
      */
     static void log(String msg) {
+        Log.w("MCProbe", msg);
         XposedInterface api = sApi;
         if (api != null) {
             api.log(Log.INFO, "LSPosed-Bridge", msg);

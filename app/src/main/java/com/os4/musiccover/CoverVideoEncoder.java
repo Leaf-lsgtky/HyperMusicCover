@@ -34,6 +34,7 @@ public class CoverVideoEncoder {
     /** The tail sample every cover video ends with, exactly as the one-frame cover always had it. */
     private static final long TAIL_MS = 100L;
 
+    private static final java.util.Map<String, Long> sCachedKeys = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile long sLastContentKey = 0;
     private static volatile String sCachedVideoPath = null;
 
@@ -105,7 +106,8 @@ public class CoverVideoEncoder {
             contentKey = contentKey * 31L + computeBitmapChecksum(from);
         }
 
-        if (contentKey != 0 && contentKey == sLastContentKey && destFile.exists() && destFile.length() > 0) {
+        Long cachedKey = sCachedKeys.get(destFile.getAbsolutePath());
+        if (contentKey != 0 && cachedKey != null && cachedKey == contentKey && destFile.exists() && destFile.length() > 0) {
             Xp.log(TAG + "encodeBitmapToMp4: reusing cached video at " + destFile.getAbsolutePath());
             sCachedVideoPath = destFile.getAbsolutePath();
             return true;
@@ -280,6 +282,7 @@ public class CoverVideoEncoder {
                 return false;
             }
 
+            sCachedKeys.put(destFile.getAbsolutePath(), contentKey);
             sLastContentKey = contentKey;
             sCachedVideoPath = destFile.getAbsolutePath();
             long cost = SystemClock.uptimeMillis() - startTime;

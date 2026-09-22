@@ -141,6 +141,13 @@ public class Main extends XposedModule {
     private static volatile View sVideoBg;
     /** The bitmap currently on sCover, ours to recycle when it is replaced. */
     private static volatile Bitmap sCoverBitmap;
+    /** The frosted copy on sCover during lyric display. */
+    private static volatile Bitmap sCoverBlurBitmap;
+    private static volatile boolean sVideoCoverBlurred;
+
+    static boolean isVideoWallpaper() {
+        return sVideoWallpaper;
+    }
 
     static volatile View sContainer;
     private static volatile Class<?> sContainerCls;
@@ -1974,7 +1981,6 @@ public class Main extends XposedModule {
                         else if ("spring".equals(k)) setClockResponse(Float.parseFloat(v));
                         else if ("mcart".equals(k)) sMcHideArt = "1".equals(v);
                         else if ("mclyricart".equals(k)) sMcArtInLyrics = "1".equals(v);
-                        else if ("mctext".equals(k)) sMcCenterText = "1".equals(v);
                         else if ("mctap".equals(k)) sMcTitleTap = "1".equals(v);
                         else if ("tap".equals(k)) sTapToggle = "1".equals(v);
                         else if ("fadewp".equals(k)) sFadeWp = "1".equals(v);
@@ -2389,6 +2395,7 @@ public class Main extends XposedModule {
                         // which is the report that the blur arrives half a beat late. Pump
                         // redraws until the swap has certainly landed. See startBlurSync().
                         startBlurSync(i.getStringExtra("why"));
+                        LockLyrics.onVideoReload();
                         // The rebuild also resets the wallpaper-side render state, and with it
                         // the AOD's wallpaper dim (set through setWallpaperBlack /
                         // setWallPaperAnimProcess - see sLastWallpaperBlack). Re-assert it once
@@ -5631,7 +5638,7 @@ public class Main extends XposedModule {
         // looking at, and the clock is not springing either.
         out.putExtra("fade", sFadeWp && screenOn());
         if (!on) {
-            if (sVideoWallpaper) showVideoCover(ctx, false, null, 0);
+            if (sVideoWallpaper) showVideoCover(ctx, false, null, null, 0);
             out.putExtra("off", true);
             ctx.sendBroadcast(out);
             sTrackKey = "";
@@ -5746,7 +5753,13 @@ public class Main extends XposedModule {
             // The print of the ARTWORK, not of this composed bitmap: the bias moves where the
             // sharp band sits, so the composed picture differs on every slider tick while the
             // album has not changed at all - and a fade on each of those would breathe.
-            showVideoCover(ctx, true, full, artPrint(art));
+            Bitmap frosted = null;
+            try {
+                frosted = CoverCompose.frosted(full);
+            } catch (Throwable t) {
+                Xp.log(TAG + "frosted video cover failed: " + t);
+            }
+            showVideoCover(ctx, true, full, frosted, artPrint(art));
         } else {
             full.recycle();
         }
@@ -5774,16 +5787,18 @@ public class Main extends XposedModule {
      * is on screen at all.
      */
     private static void showVideoCover(Context ctx, boolean on, final Bitmap full,
-                                       final int artPrint) {
+                                       final Bitmap frosted, final int artPrint) {
         if (!on) {
             // Held and faded out rather than dropped on the spot: see armCoverFadeOut().
             armCoverFadeOut();
             setDepthHidden(false);
+            sVideoCoverBlurred = false;
             Xp.log(TAG + "video cover off");
             return;
         }
         if (full == null) {
             Xp.log(TAG + "video cover: no album art");
+            if (frosted != null) frosted.recycle();
             return;
         }
         main().post(new Runnable() {
@@ -5794,6 +5809,7 @@ public class Main extends XposedModule {
                     if (layer == null) {
                         Xp.log(TAG + "keyguard_background_layer not found for the video cover");
                         full.recycle();
+                        if (frosted != null) frosted.recycle();
                         return;
                     }
                     ImageView iv = sCover;
@@ -5812,10 +5828,20 @@ public class Main extends XposedModule {
                                 ViewGroup.LayoutParams.MATCH_PARENT));
                         sCover = iv;
                     }
-                    iv.setImageBitmap(full);
-                    Bitmap old = sCoverBitmap;
+                    Bitmap oldSharp = sCoverBitmap;
+                    Bitmap oldBlur = sCoverBlurBitmap;
                     sCoverBitmap = full;
-                    if (old != null && old != full) old.recycle();
+                    sCoverBlurBitmap = frosted;
+                    boolean wantBlur = LockLyrics.blurWanted();
+                    sVideoCoverBlurred = wantBlur;
+                    Bitmap target = (wantBlur && frosted != null) ? frosted : full;
+                    iv.setImageBitmap(target);
+                    if (oldSharp != null && oldSharp != full && oldSharp != frosted) {
+                        oldSharp.recycle();
+                    }
+                    if (oldBlur != null && oldBlur != full && oldBlur != frosted && oldBlur != oldSharp) {
+                        oldBlur.recycle();
+                    }
                     // The video's own cut-out subject is a second TextureView in the FOREGROUND
                     // layer, i.e. in front of the clock. Left alone it floats over the cover
                     // exactly the way deducted_image_view did on the image path.
@@ -5847,12 +5873,83 @@ public class Main extends XposedModule {
                     Xp.log(TAG + "video cover shown " + sScreenW + "x" + sScreenH
                             + " bias=" + sBias + (isNew ? " (new view)" : "")
                             + (artChanged ? " (new album)" : "")
+                            + (wantBlur ? " (frosted)" : " (sharp)")
                             + ", fade " + (sCoverFadeWaitMs > 0 ? "owed" : "not owed"));
                 } catch (Throwable t) {
                     Xp.log(TAG + "video cover failed: " + Log.getStackTraceString(t));
                 }
             }
         });
+    }
+
+    /**
+     * Crossfades the video cover ImageView between sharp and frosted copy when lyrics toggle.
+     */
+    static void updateVideoCoverBlur(final boolean blur) {
+        if (!sVideoWallpaper) return;
+        main().post(new Runnable() {
+            @Override
+            public void run() {
+                final ImageView iv = sCover;
+                if (iv == null || !sCoverMode) return;
+                if (sVideoCoverBlurred == blur) return;
+                sVideoCoverBlurred = blur;
+                final Bitmap sharp = sCoverBitmap;
+                final Bitmap frosted = sCoverBlurBitmap;
+                if (sharp == null || sharp.isRecycled()) return;
+                if (blur && (frosted == null || frosted.isRecycled())) {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                final Bitmap f = CoverCompose.frosted(sharp);
+                                main().post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (sVideoCoverBlurred && sCover == iv) {
+                                            sCoverBlurBitmap = f;
+                                            applyVideoCoverCrossfade(iv, sharp, f, true);
+                                        } else if (f != null) {
+                                            f.recycle();
+                                        }
+                                    }
+                                });
+                            } catch (Throwable t) {
+                                Xp.log(TAG + "generate frosted on demand failed: " + t);
+                            }
+                        }
+                    }, "mc-cover-blur").start();
+                    return;
+                }
+                Bitmap from = blur ? sharp : (frosted != null ? frosted : sharp);
+                Bitmap to = blur ? (frosted != null ? frosted : sharp) : sharp;
+                applyVideoCoverCrossfade(iv, from, to, blur);
+            }
+        });
+    }
+
+    private static void applyVideoCoverCrossfade(ImageView iv, Bitmap from, Bitmap to, boolean blur) {
+        if (iv == null || from == null || to == null || from == to || from.isRecycled() || to.isRecycled()) {
+            if (iv != null && to != null && !to.isRecycled()) iv.setImageBitmap(to);
+            return;
+        }
+        try {
+            android.graphics.drawable.Drawable[] layers = new android.graphics.drawable.Drawable[]{
+                    new android.graphics.drawable.BitmapDrawable(iv.getResources(), from),
+                    new android.graphics.drawable.BitmapDrawable(iv.getResources(), to)
+            };
+            android.graphics.drawable.TransitionDrawable td =
+                    new android.graphics.drawable.TransitionDrawable(layers);
+            td.setCrossFadeEnabled(true);
+            iv.setImageDrawable(td);
+            int dur = Math.max(150, Math.min(500, (int) coverFadeMs()));
+            td.startTransition(dur);
+            Xp.log(TAG + "video cover crossfading to " + (blur ? "blurred" : "sharp")
+                    + " over " + dur + "ms");
+        } catch (Throwable t) {
+            Xp.log(TAG + "video cover blur crossfade failed: " + t);
+            iv.setImageBitmap(to);
+        }
     }
 
     /**
@@ -10093,6 +10190,10 @@ public class Main extends XposedModule {
                     Bitmap b = sCoverBitmap;
                     sCoverBitmap = null;
                     if (b != null) b.recycle();
+                    Bitmap fb = sCoverBlurBitmap;
+                    sCoverBlurBitmap = null;
+                    if (fb != null && fb != b) fb.recycle();
+                    sVideoCoverBlurred = false;
                     // The live wallpaper was only hidden because this view was covering it.
                     // Whatever removed the view - an exit, a keyguard rebuild, a failure part
                     // way through - the wallpaper has to come back with it, or the lock screen
