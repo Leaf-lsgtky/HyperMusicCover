@@ -3263,6 +3263,28 @@ public class WallpaperProbe {
     }
 
     /**
+     * Whether the lock screen is up, for the shared-video case. The engines' own show/hide calls
+     * only arrive with the screen ON, so a cover pushed as the phone went to sleep - the usual
+     * way into cover mode - found the lock screen "not up" and waited for the wake, and the
+     * glass and cards changed a second after it. The keyguard being locked is the same answer
+     * without the wait, and it is adopted: the hide that comes at the unlock is then a change
+     * onKeyguardSeen() acts on, which is what takes the cover off the desktop again.
+     */
+    private static boolean lockScreenUp() {
+        if (sKeyguardUp) return true;
+        try {
+            android.app.KeyguardManager km = sCtx == null ? null
+                    : sCtx.getSystemService(android.app.KeyguardManager.class);
+            if (km != null && km.isKeyguardLocked()) {
+                sKeyguardUp = true;
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
      * The lock screen showed or hid. Only the shared-video case acts on it: there the cover sits
      * in the DESKTOP's window, so it is taken off as the lock screen goes - the desktop comes back
      * playing its own video - and put back as the lock screen returns.
@@ -3519,7 +3541,7 @@ public class WallpaperProbe {
             tellSystemUi("videoreload", "this engine crashed on a cover video before");
             return false;
         }
-        if (isDesktopEngine(eng) && !sKeyguardUp) {
+        if (isDesktopEngine(eng) && !lockScreenUp()) {
             // Shared video, and the desktop is what is on screen: the cover would be on the
             // desktop. Owed to the next lock screen instead - see onKeyguardSeen().
             sSharedSuspended = true;
@@ -3603,7 +3625,7 @@ public class WallpaperProbe {
                     final String path = videoFile.getAbsolutePath();
                     new Handler(Looper.getMainLooper()).post(() -> {
                         if (gen != sTakeoverGen.get()) return;
-                        if (isDesktopEngine(eng) && !sKeyguardUp) {
+                        if (isDesktopEngine(eng) && !lockScreenUp()) {
                             // Unlocked while this encoded, on a shared video.
                             sSharedSuspended = true;
                             tellSystemUi("videoreload", "the desktop is showing, the cover waits");
