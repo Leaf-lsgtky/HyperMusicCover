@@ -172,8 +172,14 @@ object LyriconSource {
             return null
         }
         val out = ArrayList<LyricLine>(rich.size)
+        // Where the tail of a line may run to when the bridge gave its last word no end of its
+        // own: the arrival of the line after it, the same room every other word-timed source
+        // leaves - see LyricParse.closeUntimedTail. By time, since the bridge's order is not
+        // trusted either (the rows are sorted below).
+        val begins = rich.map { it.begin.toInt() }.sorted().toIntArray()
         for (line in rich) {
-            convert(line)?.let { out.add(it) }
+            val nextStart = LyricParse.nextAfter(begins, line.begin.toInt(), line.end.toInt())
+            convert(line, nextStart)?.let { out.add(it) }
         }
         if (out.isEmpty()) return null
         out.sortBy { it.start }
@@ -198,7 +204,7 @@ object LyriconSource {
      * A line whose words are missing or unusable stays line-timed, which draws correctly and
      * simply does not fill word by word.
      */
-    private fun convert(line: RichLyricLine): LyricLine? {
+    private fun convert(line: RichLyricLine, nextStart: Int): LyricLine? {
         val text = line.text?.trim().orEmpty()
         val words = line.words
         var built: LyricLine? = null
@@ -223,7 +229,7 @@ object LyriconSource {
                 for (k in chars.indices) if (chars[k] > n) chars[k] = n
                 val s = starts.toIntArray()
                 val e = ends.toIntArray()
-                LyricParse.closeUntimedTail(s, e, line.end.toInt())
+                LyricParse.closeUntimedTail(s, e, line.end.toInt(), nextStart)
                 built = LyricLine(sb.substring(0, n), line.translation, line.begin.toInt(),
                     line.end.toInt(), line.isAlignedRight, s, e, chars.toIntArray())
             }

@@ -46,6 +46,15 @@ public final class LyricLine {
         this.sylStart = words ? sylStart : null;
         this.sylEnd = words ? sylEnd : null;
         this.charEnd = words ? charEnd : null;
+        // A word-timed line is not over while its last word is still being sung, whatever end
+        // the file reported. Most word-timed files give a line no end of its own - enhanced LRC
+        // is a timestamp per word and nothing else - and lyrics-core reads the line's end off
+        // its last syllable, which for the last word is that word's own start; the parser then
+        // gives that word the room the file was leaving it. The renderer moves the stack on at
+        // this end and stops drawing the word path at it, so an end ahead of the last syllable
+        // cuts its fill off mid-sweep: on a line whose next one starts within a second, the
+        // last word gets no sweep at all and the line leaves just as it begins.
+        if (words) this.end = Math.max(this.end, sylEnd[sylEnd.length - 1]);
     }
 
     /**
