@@ -6751,7 +6751,7 @@ public class Main extends XposedModule {
             // drawing this card, lost the thumbnail every time the screen went dark. With the
             // screen off, or in the AOD a wake has not left yet, the question is the standing one
             // instead: are the lyrics what this lock screen is showing.
-            sLyricUp = LockLyrics.wantsShown()
+            sLyricUp = LockLyrics.wantsShown() || LockLyrics.heldForBlur()
                     || ((ClockCollapse.phase() == ClockCollapse.Phase.AOD || !screenOnCached())
                         && LockLyrics.wantsAttached());
         }

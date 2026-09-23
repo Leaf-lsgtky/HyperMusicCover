@@ -171,6 +171,16 @@ final class LockLyrics {
         return true;
     }
 
+    /**
+     * Attached and only waiting out the video window's reload (blurSettled). The lyrics are
+     * coming, so for anything that lays itself out around them - the card's thumbnail - they
+     * are already up: answered by wantsShown() alone, the thumbnail went out and the title
+     * slid to the middle on every entry, then both came back when the band did.
+     */
+    static boolean heldForBlur() {
+        return wantsAttached() && !blurSettled();
+    }
+
     /** Whether the cover should be frosted right now, for a push to carry over. */
     static boolean blurWanted() {
         return (sBlurSent & 1L) != 0L;
