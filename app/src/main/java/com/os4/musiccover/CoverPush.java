@@ -484,9 +484,20 @@ final class CoverPush {
                     hideVideoSurfaces();
                     return true;
                 }
-                boolean onKeyguard = Main.sCoverMode && Main.onKeyguardNow();
+                // Only the AWAKE lock screen. The keyguard stays shown through the doze, and a
+                // live wallpaper's AOD is the OEM's plain one - the video goes black and only its
+                // cut-out subject stays. This view left up there turned the AOD into the album
+                // cover. Going down it takes the doze's own dimming; coming back it owes the
+                // fade below, so the wake dissolves from the video into the cover.
+                boolean asleep = Main.sCoverMode && !Main.screenOnCached();
+                boolean onKeyguard = Main.sCoverMode && Main.onKeyguardNow() && !asleep;
                 int want = onKeyguard ? View.VISIBLE : View.INVISIBLE;
                 if (cover.getVisibility() != want) cover.setVisibility(want);
+                if (asleep && cover.getAlpha() > 0f) {
+                    cover.animate().cancel();
+                    cover.setAlpha(0f);
+                    if (sCoverFadeWaitMs <= 0) sCoverFadeWaitMs = coverFadeMs();
+                }
                 if (onKeyguard) {
                     // The one place the cover's fade can start from. This runs on the frame the
                     // cover is really being drawn in, which is the frame the fade is for - the
