@@ -645,25 +645,21 @@ final class CoverPush {
      * next drawn in, which only the pre-draw guard knows. See sCoverFadeWaitMs.
      */
     private static void armCoverFade() {
+        // Started on the cover's first drawn frame, never held for the window. Held, the lock
+        // screen sat on the user's video for the whole encode and reload - a third of a second
+        // with the clock already collapsing - and then the cover arrived at once: "slow, and no
+        // transition". Instead the dissolve is stretched to the window's measured head start
+        // when that is the longer of the two, so it is still under way when the window swaps,
+        // and the glass and the cards change under a cover that is nearly opaque.
         long ms = coverFadeMs();
-        if (Main.sFadeMode == Main.FADE_MODE_STRETCH && sCoverFadeGapMs > 0) {
-            // The window's own head start, which is the length that lands this dissolve on top of
-            // the window's swap instead of ~400ms before it.
-            ms = Math.max(COVER_FADE_MIN_MS, Math.min(COVER_FADE_MAX_MS, sCoverFadeGapMs));
+        if (sCoverFadeGapMs > 0) {
+            ms = Math.max(ms, Math.min(COVER_FADE_MAX_MS, sCoverFadeGapMs));
         }
         sCoverFadeWaitMs = ms;
         sCoverFadeArmedAt = android.os.SystemClock.uptimeMillis();
-        // The old deadline comes off before the new state is decided, not after: a mode that
-        // does not hold leaves nothing to time out, and an old callback left pending would fire
-        // into whatever transition is running by then.
         Main.main().removeCallbacks(sCoverFadeTimeout);
-        sCoverFadeWaiting = Main.sFadeMode == Main.FADE_MODE_HOLD;
-        Xp.log(Main.TAG + "cover fade armed: " + ms + "ms, mode=" + fadeModeName()
-                + ", last gap=" + sCoverFadeGapMs + "ms"
-                + (Main.sFadeMode == Main.FADE_MODE_STRETCH && sCoverFadeGapMs <= 0
-                ? " (nothing measured yet, using the crossfade length)" : ""));
-        if (!sCoverFadeWaiting) return;
-        Main.main().postDelayed(sCoverFadeTimeout, COVER_FADE_SIGNAL_TIMEOUT_MS);
+        sCoverFadeWaiting = false;
+        Xp.log(Main.TAG + "cover fade armed: " + ms + "ms, last gap=" + sCoverFadeGapMs + "ms");
     }
 
     /**

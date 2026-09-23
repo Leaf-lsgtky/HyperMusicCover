@@ -1862,8 +1862,8 @@ public class WallpaperProbe {
                                 new File(c.getFilesDir(), ART_FILE).delete();
                                 new File(c.getFilesDir(), SRC_FILE).delete();
                                 new File(c.getFilesDir(), "mc_card_mode").delete();
-                                new File(c.getFilesDir(), COVER_VIDEO_FILE).delete();
-                                new File(c.getFilesDir(), COVER_VIDEO_BLUR_FILE).delete();
+                                // The cover videos stay: coming back into cover mode on the same
+                                // album then reloads from the cache instead of encoding again.
                                 videoWindowTakeover(true);
                                 return;
                             }
@@ -3858,11 +3858,20 @@ public class WallpaperProbe {
         final long want = target;
         final boolean parkIt = park;
         final Handler h = new Handler(Looper.getMainLooper());
+        // SystemUI is told now, with the first seek, not after it has been read back: the
+        // cover view over the window starts its fade-out on this word, and its first frames are
+        // still nearly opaque while the seek lands. Waiting for the read-back held the cover up
+        // a further quarter to three quarters of a second on every exit.
+        final boolean[] told = {!tell};
         final int[] tries = {0};
         final Runnable[] step = new Runnable[1];
         step[0] = () -> {
             if (gen != sTakeoverGen.get()) return;
             playerSeek(lockPlayer(eng), want);
+            if (!told[0]) {
+                told[0] = true;
+                tellSystemUi("videoreload", "the wallpaper's video is back, seeking to " + want + "ms");
+            }
             h.postDelayed(() -> {
                 if (gen != sTakeoverGen.get()) return;
                 Object now = lockPlayer(eng);
@@ -3877,7 +3886,7 @@ public class WallpaperProbe {
                 }
                 if (parkIt) playerPause(now);
                 Xp.log(TAG + "restore: at " + at + "ms after " + (tries[0] + 1) + " seek(s)");
-                if (tell) tellSystemUi("videoreload", "the wallpaper's video is back at " + at + "ms");
+                Xp.log(TAG + "restore: settled at " + at + "ms");
             }, SEEK_VERIFY_MS);
         };
         h.post(step[0]);

@@ -305,6 +305,27 @@ public class Main extends XposedModule {
      */
     private static volatile boolean sDepthHidden;
     /**
+     * The OEM's cut-out ImageView (deducted_image_view), and the visibility the OEM itself last
+     * gave it. On a depth VIDEO wallpaper it holds the last frame's subject for the AOD, and the
+     * OEM keeps it INVISIBLE on the awake lock screen, where the video's own cut-out TextureView
+     * does the job. Handing it back as VISIBLE - what this used to do - left that last frame's
+     * subject pinned over the playing video: a sheep's fleece in the corner and pine branches
+     * that belonged to another frame. What goes back is what the OEM last asked for.
+     */
+    private static volatile View sDeductedRef;
+    private static volatile int sDeductedWanted = -1;
+    private static volatile boolean sDeductedHeld;
+    private static volatile boolean sOwnDepthWrite;
+
+    private static void setDeductedVisibility(View d, int v) {
+        sOwnDepthWrite = true;
+        try {
+            d.setVisibility(v);
+        } finally {
+            sOwnDepthWrite = false;
+        }
+    }
+    /**
      * Hiding the cut-out once is not ownership. The OEM re-shows it from more than one place -
      * updateDeductedImageView is only the one we caught first, and the Folme alpha animators on
      * the same view (setDepthTransitionAlpha / deductedTranslateAlphaFolmeAnimator) reach it
@@ -1127,6 +1148,22 @@ public class Main extends XposedModule {
             Xp.log(TAG + "depth ownership hooked");
         } catch (Throwable t) {
             Xp.log(TAG + "depth ownership hook failed: " + t);
+        }
+
+        // What the OEM itself wants of its cut-out view while we hold it hidden. See sDeductedRef.
+        // ImageView declares its own setVisibility, so this sees ImageViews only, and it acts on
+        // exactly one of them.
+        try {
+            Xp.hookAll(android.widget.ImageView.class, "setVisibility", chain -> {
+                if (!sOwnDepthWrite && chain.getThisObject() == sDeductedRef) {
+                    Object a = chain.getArgs().get(0);
+                    if (a instanceof Integer) sDeductedWanted = (Integer) a;
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "cut-out visibility watched");
+        } catch (Throwable t) {
+            Xp.log(TAG + "cut-out visibility hook failed: " + t);
         }
 
         // The full-screen AOD's shrink, and the one view that must not take it.
@@ -1954,8 +1991,16 @@ public class Main extends XposedModule {
                         // What each layer of a live cover is showing right now, as average colours:
                         // MIUI's two video TextureViews (whatever the player last put in them,
                         // hidden or not) and our own cover view.
+                        View dd = findDeductedImageView();
                         setResultData("bg=" + avgColour(sVideoBg) + " fg=" + avgColour(sVideoFg)
-                                + " cover=" + avgColour(sCover) + " uncover=" + sUncoverProbe);
+                                + " cover=" + avgColour(sCover) + " uncover=" + sUncoverProbe
+                                + " deducted=" + (dd == null ? "absent" : dd.getClass().getName()
+                                + " vis=" + dd.getVisibility() + " alpha=" + r2(dd.getAlpha())
+                                + " tAlpha=" + r2(dd.getTransitionAlpha())
+                                + " drawable=" + (dd instanceof ImageView
+                                ? ((ImageView) dd).getDrawable() : "-"))
+                                + " depthHidden=" + sDepthHidden + " oemWants=" + sDeductedWanted
+                                + " held=" + sDeductedHeld);
                     } else if ("uncover".equals(op)) {
                         // Hides our cover view only, leaving MIUI's layers as they are, so a
                         // screenshot shows what is under it. See CoverPush.guardVideoCover.
@@ -6386,7 +6431,17 @@ public class Main extends XposedModule {
                     retryDepth(hide, attempt, "deducted_image_view not found");
                     return;
                 }
-                d.setVisibility(hide ? View.INVISIBLE : View.VISIBLE);
+                sDeductedRef = d;
+                if (hide) {
+                    if (!sDeductedHeld) {
+                        sDeductedWanted = d.getVisibility();
+                        sDeductedHeld = true;
+                    }
+                    setDeductedVisibility(d, View.INVISIBLE);
+                } else if (sDeductedHeld) {
+                    sDeductedHeld = false;
+                    setDeductedVisibility(d, sDeductedWanted >= 0 ? sDeductedWanted : View.VISIBLE);
+                }
                 // On a live wallpaper the cut-out subject is a TextureView in the same layer
                 // rather than this ImageView, and it is in front of the clock just the same.
                 // Resolved every time rather than cached: it is added and removed by MIUI as
@@ -6450,7 +6505,7 @@ public class Main extends XposedModule {
                 if (sDepthHidden && d.getVisibility() == View.VISIBLE) {
                     // VISIBLE -> INVISIBLE only invalidates, it does not request a layout, so
                     // this cannot start a traversal loop.
-                    d.setVisibility(View.INVISIBLE);
+                    setDeductedVisibility(d, View.INVISIBLE);
                     if (++sDepthTakebacks <= 5 || sDepthTakebacks % 100 == 0) {
                         Xp.log(TAG + "system re-showed the cut-out, re-hidden ("
                                 + sDepthTakebacks + ")");
