@@ -5924,8 +5924,11 @@ public class Main extends XposedModule {
             recolorClock();
         }
         armTransitionTrace("leaving cover mode");
-        // The cut-out belongs to the wallpaper, and the wallpaper is already on its way back.
-        setDepthHidden(false);
+        // The cut-out belongs to the wallpaper, and the wallpaper is already on its way back -
+        // except on a video wallpaper with the cover view still up: that view is held over the
+        // window until the window has the video again, and the cut-out comes back with it going
+        // (CoverPush.dropVideoCover), not in front of it now.
+        if (!(sVideoWallpaper && sCover != null)) setDepthHidden(false);
         ClockCollapse.exit(animate);
         // No applyMediaCard() while the exit is flying: it would drop the card's guard, and the
         // guard is what draws every frame of the thumbnail coming back. onClockReleased() hands
@@ -8652,6 +8655,7 @@ public class Main extends XposedModule {
         CoverPush.sCoverFadeWaitMs = 0;
         CoverPush.sCoverFadeWaiting = false;
         CoverPush.sCoverFadingOut = null;
+        CoverPush.sOwedSwap = null;
         // The view is going, so it shows nothing: the next push owes a fade whatever it carries.
         CoverPush.sShownArtPrint = 0;
         main().removeCallbacks(CoverPush.sCoverFadeTimeout);

@@ -3867,7 +3867,11 @@ public class WallpaperProbe {
                 if (gen != sTakeoverGen.get()) return;
                 Object now = lockPlayer(eng);
                 long at = playerPositionMs(now);
-                if (at < want - SEEK_TOLERANCE_MS && ++tries[0] < 3) {
+                // A park is not read back: a finished play-once player reports where its last
+                // decoded frame sits, not the seek target (5200ms against 5960ms, measured), so
+                // the read-back never agreed and three more seeks held the SystemUI cover up for
+                // three quarters of a second longer on every exit.
+                if (!parkIt && at < want - SEEK_TOLERANCE_MS && ++tries[0] < 3) {
                     h.post(step[0]);
                     return;
                 }
