@@ -101,13 +101,15 @@ object LyricParse {
         val lyrics = AutoParser().parse(body)
         val src = lyrics.lines
         val out = ArrayList<LyricLine>(src.size)
-        for (i in src.indices) {
-            val line = src[i]
-            // Where the tail of this line may run to when the file left it without an end of its
-            // own: the arrival of the line after it. Read off the list and not by looking up a
-            // time, because the parsers hand the lines over in the order they are sung. The last
-            // line of a song has nothing after it, and keeps whatever the file gave it.
-            val nextStart = src.getOrNull(i + 1)?.start ?: line.end
+        // Where the tail of a line may run to when the file left it without an end of its own:
+        // the arrival of the line after it. Looked up by time and not read off the list: the list
+        // is sorted only at the end of this function, and a background vocal handed back as a
+        // line of its own starts inside the line it echoes - taken as the next line, it would cut
+        // the last word down to the few milliseconds before the echo.
+        val mains = src.filter { it !is KaraokeLine.AccompanimentKaraokeLine }
+            .map { it.start }.sorted().toIntArray()
+        for (line in src) {
+            val nextStart = nextAfter(mains, line.start, line.end)
             when (line) {
                 // Background vocals overlap the main line in time, so they are not lines of their
                 // own - the renderer finds the singing line by start time, and one would steal
@@ -151,6 +153,16 @@ object LyricParse {
         }
         out.sortBy { it.start }
         return speakers(out)
+    }
+
+    /**
+     * The first of the sorted starts that is later than t: when the line starting at t is followed
+     * by another. The last line of a song has nothing after it, and gets the fallback.
+     */
+    internal fun nextAfter(sorted: IntArray, t: Int, fallback: Int): Int {
+        val i = sorted.binarySearch(t + 1)
+        val at = if (i >= 0) i else -i - 1
+        return if (at < sorted.size) sorted[at] else fallback
     }
 
     private fun karaoke(line: KaraokeLine, nextStart: Int): LyricLine? {
@@ -225,9 +237,14 @@ object LyricParse {
             // A line whose own end is no later than its last word - which is what a file that
             // times lines by their words alone reports - leaves nothing to go on but the next
             // line's arrival.
+            // The dots are drawn when what is left after this line's end reaches the lull, and
+            // that end is the nominal one when the word does not run on - so it is the wait
+            // after the nominal span that decides, or a gap just over four seconds would get
+            // neither the held word nor the dots.
             if (to <= from) {
-                to = if (nextStart - from in 1..MAX_HELD_MS) nextStart
-                else from + NOMINAL_WORD_MS * (last - k + 1)
+                val nominal = from + NOMINAL_WORD_MS * (last - k + 1)
+                to = if (nextStart > from && nextStart - nominal < MAX_HELD_MS) nextStart
+                else nominal
             }
             val count = last - k + 1
             for (m in k..last) ends[m] = from + (to - from) * (m - k + 1) / count
@@ -243,9 +260,9 @@ object LyricParse {
     private const val NOMINAL_WORD_MS = 300
 
     /**
-     * The longest a last word can be taken to still be sounding. A wait longer than this is not a
-     * note held across it but an interlude, and the renderer is about to draw its dots through
-     * that space anyway (the same four seconds; see LyricView.LULL_MS).
+     * How long a wait may be left after a last word's nominal span before it stops being a note
+     * held across it and becomes an interlude, which the renderer is about to draw its dots
+     * through anyway (the same four seconds; see LyricView.LULL_MS).
      */
     private const val MAX_HELD_MS = 4000
 

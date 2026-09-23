@@ -172,12 +172,14 @@ object LyriconSource {
             return null
         }
         val out = ArrayList<LyricLine>(rich.size)
-        for (i in rich.indices) {
-            // Where the tail of this line may run to when the bridge gave its last word no end of
-            // its own: the arrival of the line after it, the same room every other word-timed
-            // source leaves - see LyricParse.closeUntimedTail.
-            val nextStart = rich.getOrNull(i + 1)?.begin?.toInt() ?: rich[i].end.toInt()
-            convert(rich[i], nextStart)?.let { out.add(it) }
+        // Where the tail of a line may run to when the bridge gave its last word no end of its
+        // own: the arrival of the line after it, the same room every other word-timed source
+        // leaves - see LyricParse.closeUntimedTail. By time, since the bridge's order is not
+        // trusted either (the rows are sorted below).
+        val begins = rich.map { it.begin.toInt() }.sorted().toIntArray()
+        for (line in rich) {
+            val nextStart = LyricParse.nextAfter(begins, line.begin.toInt(), line.end.toInt())
+            convert(line, nextStart)?.let { out.add(it) }
         }
         if (out.isEmpty()) return null
         out.sortBy { it.start }
