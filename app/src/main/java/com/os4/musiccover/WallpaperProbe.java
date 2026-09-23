@@ -3403,6 +3403,7 @@ public class WallpaperProbe {
      * restore needs.
      */
     private static void hookPlayerLoop() {
+        hookPlayerStart();
         try {
             Xp.hookAll(Xp.findClass(CLS_FASTPLAYER, sCl), "setLoop", LOOP_HOOKER);
             Xp.log(TAG + "FastPlayer.setLoop hooked (lock player only)");
@@ -3681,6 +3682,14 @@ public class WallpaperProbe {
         final long savedAt = sSavedVideoAtMs;
         final String path = sLockVideoPath;
         sSavedVideoPosMs = -1L;
+        sPreSeeked = -1L;
+        if (savedPos >= 0) {
+            sPreSeekEng = eng;
+            sPreSeekPath = path;
+            sPreSeekAt = savedAt;
+            sPreSeekUntil = SystemClock.uptimeMillis() + FIRST_FRAME_TIMEOUT_MS;
+            sPreSeekPos = savedPos;
+        }
         reloadThen(eng, gen, fp -> restorePosition(eng, gen, path, savedPos, savedAt, tell));
     }
 
@@ -3838,22 +3847,28 @@ public class WallpaperProbe {
                                         final long savedPos, final long savedAt,
                                         final boolean tell) {
         long dur = videoDurationMs(path);
-        long target = savedPos < 0 ? 0L : savedPos + (SystemClock.uptimeMillis() - savedAt);
-        boolean park = false;
-        if (dur > 0) {
-            Boolean loops = sLockLoops;
-            if (loops != null && loops) {
-                target %= dur;
-            } else if (target >= dur - END_ZONE_MS) {
-                target = Math.max(1L, dur - PARK_FROM_END_MS);
-                park = true;
-            }
-        }
+        long[] t = restoreTarget(path, savedPos, savedAt);
+        long target = t[0];
+        boolean park = t[1] != 0L;
         Xp.log(TAG + "restore: saved " + savedPos + "ms, target " + target + "ms of " + dur
                 + "ms, loops=" + sLockLoops + (park ? ", parking on the last frame" : ""));
         if (target <= 100L && !park) {
             if (tell) tellSystemUi("videoreload", "the wallpaper's video is back");
             return;
+        }
+        // Normally already done: the seek went in before the rebuilt player's start (see
+        // hookPlayerStart), so its first frame is the target and there is nothing to land. Only
+        // a read-back that says otherwise falls through to seeking the running player.
+        long pre = sPreSeeked;
+        sPreSeeked = -1L;
+        if (pre > 0L) {
+            long at = playerPositionMs(lockPlayer(eng));
+            if (park ? at >= pre - SEEK_TOLERANCE_MS - 500L : at >= target - SEEK_TOLERANCE_MS) {
+                Xp.log(TAG + "restore: seeked to " + pre + "ms before the first frame, at " + at + "ms");
+                if (tell) tellSystemUi("videoreload", "the wallpaper's video is back at " + at + "ms");
+                return;
+            }
+            Xp.log(TAG + "restore: the seek before start did not hold (at " + at + "ms)");
         }
         final long want = target;
         final boolean parkIt = park;
@@ -3890,6 +3905,100 @@ public class WallpaperProbe {
             }, SEEK_VERIFY_MS);
         };
         h.post(step[0]);
+    }
+
+    /**
+     * Where the user's video should resume: {target ms, 1 when it parks on its last frame}. A
+     * looping video wraps; a play-once video that would have finished parks instead of
+     * replaying its ending.
+     */
+    private static long[] restoreTarget(String path, long savedPos, long savedAt) {
+        long dur = videoDurationMs(path);
+        long target = savedPos < 0 ? 0L : savedPos + (SystemClock.uptimeMillis() - savedAt);
+        long park = 0L;
+        if (dur > 0) {
+            Boolean loops = sLockLoops;
+            if (loops != null && loops) {
+                target %= dur;
+            } else if (target >= dur - END_ZONE_MS) {
+                target = Math.max(1L, dur - PARK_FROM_END_MS);
+                park = 1L;
+            }
+        }
+        return new long[] {target, park};
+    }
+
+    /**
+     * A restore owed to the rebuilt player's start. The rebuild always starts from zero, and
+     * a seek after the fact shows frame 0 for the quarter second it takes to land - on the
+     * wallpaper window, which is what the lock screen's cards and notifications blur. So the
+     * first frame after an exit was the video's opening frame in every card (a green flash on
+     * the sheep video), with the right frame only arriving after the cover had gone. Seeking
+     * before start is what the OEM's own startInternal does (seekTo 0 when COMPLETED), so the
+     * first frame the window gets is already the right one.
+     */
+    private static volatile Object sPreSeekEng;
+    private static volatile String sPreSeekPath;
+    private static volatile long sPreSeekPos = -1L;
+    private static volatile long sPreSeekAt;
+    private static volatile long sPreSeekUntil;
+    /** Where the seek before start went, -1 when none did. */
+    private static volatile long sPreSeeked = -1L;
+
+    private static void hookPlayerStart() {
+        try {
+            Xp.hookAll(Xp.findClass(CLS_FASTPLAYER, sCl), "start", chain -> {
+                long pos = sPreSeekPos;
+                if (pos >= 0 && SystemClock.uptimeMillis() < sPreSeekUntil) {
+                    Object eng = sPreSeekEng;
+                    Object self = chain.getThisObject();
+                    if (eng != null && lockPlayer(eng) == self) {
+                        sPreSeekPos = -1L;
+                        long target = restoreTarget(sPreSeekPath, pos, sPreSeekAt)[0];
+                        if (target > 100L) {
+                            try {
+                                Xp.callMethod(self, "seekto", 0.0f, target, 0);
+                                sPreSeeked = target;
+                            } catch (Throwable t) {
+                                Xp.log(TAG + "seek before start failed: " + t);
+                            }
+                        }
+                    }
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "FastPlayer.start hooked (restore seek before start)");
+        } catch (Throwable t) {
+            Xp.log(TAG + "FastPlayer.start hook failed: " + t);
+        }
+        // The plain shape's player, the same story: its reload is a reset MediaPlayer, and the
+        // quarter second from its frame 0 to the seek was frame 0 in every card.
+        try {
+            Xp.hookAll(android.media.MediaPlayer.class, "start", chain -> {
+                long pos = sPreSeekPos;
+                if (pos >= 0 && SystemClock.uptimeMillis() < sPreSeekUntil) {
+                    Object eng = sPreSeekEng;
+                    Object self = chain.getThisObject();
+                    if (eng != null && lockPlayer(eng) == self) {
+                        sPreSeekPos = -1L;
+                        long target = restoreTarget(sPreSeekPath, pos, sPreSeekAt)[0];
+                        if (target > 100L) {
+                            try {
+                                ((android.media.MediaPlayer) self).seekTo(target,
+                                        android.media.MediaPlayer.SEEK_CLOSEST);
+                                sPreSeeked = target;
+                            } catch (Throwable t) {
+                                Xp.log(TAG + "seek before start failed: " + t);
+                            }
+                        }
+                    }
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "MediaPlayer.start hooked (restore seek before start)");
+        } catch (Throwable t) {
+            Xp.log(TAG + "MediaPlayer.start hook failed: " + t);
+        }
     }
 
     /** Duration of a video file, cached per path. 0 when unknown. */
