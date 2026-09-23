@@ -49,6 +49,7 @@ final class Xp {
      * way the old XposedBridge.log was, so `logcat | grep MCProbe` still works.
      */
     static void log(String msg) {
+        Log.w("MCProbe", msg);
         XposedInterface api = sApi;
         if (api != null) {
             api.log(Log.INFO, "LSPosed-Bridge", msg);
@@ -211,6 +212,16 @@ final class Xp {
         } catch (ReflectiveOperationException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new IllegalStateException(obj.getClass().getName() + "." + name + " threw", cause);
+        }
+    }
+
+    static Object callStaticMethod(Class<?> cls, String name, Object... args) {
+        Method m = findMethod(cls, name, args);
+        try {
+            return m.invoke(null, args);
+        } catch (ReflectiveOperationException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new IllegalStateException(cls.getName() + "." + name + " threw", cause);
         }
     }
 

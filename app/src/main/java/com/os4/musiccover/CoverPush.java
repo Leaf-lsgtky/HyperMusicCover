@@ -71,15 +71,6 @@ final class CoverPush {
     }
 
     private static void pushArtToWallpaper(Context ctx, boolean on, Bitmap art) {
-        // A live lock wallpaper needs BOTH halves, and returning here after the first was why
-        // the card and the clock glass stayed on the video: this view covers the background,
-        // but those two sample the wallpaper WINDOW, and the only thing that paints it is the
-        // broadcast below. Falling through is what makes the wallpaper process paint it.
-        //
-        // It costs one extra compose per track change on this path - showVideoCover() composes
-        // for the view and the JPEG below composes again. Worth folding into one later; the
-        // correctness of having both matters more than the ~100ms.
-        if (Main.sVideoWallpaper) showVideoCover(ctx, on, art);
         long t0 = android.os.SystemClock.uptimeMillis();
         Intent out = wallpaperIntent("art");
         out.putExtra("cardmode", Main.sCoverCardStyle.mode == CoverCardStyle.CARD);
@@ -111,6 +102,7 @@ final class CoverPush {
         out.putExtra("fade", Main.sFadeWp && Main.screenOn());
         if (!on) {
             CoverCardLayer.clear();
+            if (Main.sVideoWallpaper) showVideoCover(ctx, false, null, null, 0);
             out.putExtra("off", true);
             ctx.sendBroadcast(out);
             Main.sTrackKey = "";
@@ -194,8 +186,9 @@ final class CoverPush {
             jpg = bos.toByteArray();
             q -= 15;
         } while (jpg.length > 700 * 1024 && q > 25);
-        // Everything has finished with it: the measurement, the clock recolour and the JPEG.
-        full.recycle();
+        // The cover video's own crossfade is built in the wallpaper process out of this, so
+        // whether to ask for it has to travel with the push. See sVideoFade.
+        out.putExtra("vfade", Main.sVideoFade);
         // By path, not by value, and that is not an optimisation.
         //
         // Measured on this phone: the largest cover in the library composes to 612KB, the
@@ -212,6 +205,7 @@ final class CoverPush {
         String shared = writeSharedArt(jpg);
         if (shared != null) out.putExtra("file", shared);
         else out.putExtra("jpg", jpg);
+        // Send broadcast first so wallpaper process begins decoding/encoding immediately!
         out.putExtra("tsent", android.os.SystemClock.uptimeMillis());
         ctx.sendBroadcast(out);
         // After the send: the shade's background is not what anyone is waiting on.
@@ -219,6 +213,21 @@ final class CoverPush {
         Xp.log(Main.TAG + "pushart " + w + "x" + h + " bias=" + Main.sBias
                 + " as " + jpg.length + "B jpeg, draw " + (tc - t0) + "ms encode "
                 + (android.os.SystemClock.uptimeMillis() - tc) + "ms");
+
+        if (Main.sVideoWallpaper) {
+            // The print of the ARTWORK, not of this composed bitmap: the bias moves where the
+            // sharp band sits, so the composed picture differs on every slider tick while the
+            // album has not changed at all - and a fade on each of those would breathe.
+            Bitmap frosted = null;
+            try {
+                frosted = CoverCompose.frosted(full);
+            } catch (Throwable t) {
+                Xp.log(Main.TAG + "frosted video cover failed: " + t);
+            }
+            showVideoCover(ctx, true, full, frosted, artPrint(art));
+        } else {
+            full.recycle();
+        }
     }
 
     /**
@@ -241,24 +250,21 @@ final class CoverPush {
      * Cheaper than the image path, too: no JPEG round trip and no cross-process broadcast, so
      * the composed bitmap goes straight onto the view.
      */
-    private static void showVideoCover(Context ctx, boolean on, Bitmap art) {
+    private static void showVideoCover(Context ctx, boolean on, final Bitmap full,
+                                       final Bitmap frosted, final int artPrint) {
         if (!on) {
-            Main.detachCover();
+            // Held and faded out rather than dropped on the spot: see armCoverFadeOut().
+            armCoverFadeOut();
             Main.setDepthHidden(false);
+            Main.sVideoCoverBlurred = false;
             Xp.log(Main.TAG + "video cover off");
             return;
         }
-        if (art == null) {
+        if (full == null) {
             Xp.log(Main.TAG + "video cover: no album art");
+            if (frosted != null) frosted.recycle();
             return;
         }
-        long t0 = android.os.SystemClock.uptimeMillis();
-        // Composed here, on the worker, exactly as for the image path - same mirror-extend,
-        // blur and bias, so the two paths produce the same picture.
-        final Bitmap full = composeWallpaper(art, Main.sScreenW, Main.sScreenH, Main.sBias);
-        Main.measureCover(full);
-        if (Main.sCoverMode) Main.recolorClock();
-        final long draw = android.os.SystemClock.uptimeMillis() - t0;
         Main.main().post(new Runnable() {
             @Override
             public void run() {
@@ -267,13 +273,16 @@ final class CoverPush {
                     if (layer == null) {
                         Xp.log(Main.TAG + "keyguard_background_layer not found for the video cover");
                         full.recycle();
+                        if (frosted != null) frosted.recycle();
                         return;
                     }
                     ImageView iv = Main.sCover;
-                    if (iv == null || iv.getParent() != layer) {
+                    boolean isNew = (iv == null || iv.getParent() != layer);
+                    if (isNew) {
                         Main.detachCover();
                         iv = new ImageView(ctx);
                         iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                        iv.setAlpha(0f);
                         // Added last, so it draws over the video's TextureView. The layer is
                         // ordered, and a TextureView draws in the view hierarchy like any other
                         // view - unlike a SurfaceView, which would punch through whatever we
@@ -283,7 +292,6 @@ final class CoverPush {
                                 ViewGroup.LayoutParams.MATCH_PARENT));
                         Main.sCover = iv;
                     }
-                    iv.setImageBitmap(full);
                     if (Main.sCoverCardStyle.mode == CoverCardStyle.CARD) {
                         CoverCardLayer.attach(layer);
                         CoverCardLayer.style(Main.sCoverCardStyle);
@@ -291,21 +299,128 @@ final class CoverPush {
                         // over there will say it is up: this line is.
                         CoverCardLayer.releaseHeld();
                     }
-                    Bitmap old = Main.sCoverBitmap;
+                    Bitmap oldSharp = Main.sCoverBitmap;
+                    Bitmap oldBlur = Main.sCoverBlurBitmap;
                     Main.sCoverBitmap = full;
-                    if (old != null && old != full) old.recycle();
+                    Main.sCoverBlurBitmap = frosted;
+                    boolean wantBlur = LockLyrics.blurWanted();
+                    Main.sVideoCoverBlurred = wantBlur;
+                    Bitmap target = (wantBlur && frosted != null) ? frosted : full;
+                    iv.setImageBitmap(target);
+                    if (oldSharp != null && oldSharp != full && oldSharp != frosted) {
+                        oldSharp.recycle();
+                    }
+                    if (oldBlur != null && oldBlur != full && oldBlur != frosted && oldBlur != oldSharp) {
+                        oldBlur.recycle();
+                    }
                     // The video's own cut-out subject is a second TextureView in the FOREGROUND
                     // layer, i.e. in front of the clock. Left alone it floats over the cover
                     // exactly the way deducted_image_view did on the image path.
                     Main.setDepthHidden(true);
                     guardVideoCover(iv);
+
+                    // A TRACK CHANGE IS THE SAME PROBLEM as coming into cover mode, which is why
+                    // it arms the same fade: this view takes the new artwork the moment it is
+                    // composed, while the wallpaper window keeps the previous one until its own
+                    // reload lands - so the eye's background and the cards' blurred background
+                    // would change a gap apart, which is the original report, one track later.
+                    // The artwork print is what tells a new album from the same one re-composed.
+                    boolean artChanged = artPrint != 0 && artPrint != sShownArtPrint;
+                    sShownArtPrint = artPrint;
+
+                    // Fade in to bridge FastPlayer's first frame render (~120-150ms), so the
+                    // background and the card's blur do not change on two different frames. OWED
+                    // rather than started - see sCoverFadeWaitMs: this runs on a posted main
+                    // thread task, and the cover is very often not on screen yet when it does.
+                    if (isNew || iv.getAlpha() < 1f || artChanged) {
+                        // A fade-out still in flight is cancelled rather than left to fight this
+                        // one: it would drive the alpha back down as this drives it up. Reaching
+                        // here mid-fade-out means the user put the cover back before it was gone.
+                        iv.animate().cancel();
+                        sCoverFadingOut = null;
+                        iv.setAlpha(0f);
+                        armCoverFade();
+                    }
                     Xp.log(Main.TAG + "video cover shown " + Main.sScreenW + "x" + Main.sScreenH
-                            + " bias=" + Main.sBias + ", draw " + draw + "ms");
+                            + " bias=" + Main.sBias + (isNew ? " (new view)" : "")
+                            + (artChanged ? " (new album)" : "")
+                            + (wantBlur ? " (frosted)" : " (sharp)")
+                            + ", fade " + (sCoverFadeWaitMs > 0 ? "owed" : "not owed"));
                 } catch (Throwable t) {
                     Xp.log(Main.TAG + "video cover failed: " + Log.getStackTraceString(t));
                 }
             }
         });
+    }
+
+    /**
+     * Crossfades the video cover ImageView between sharp and frosted copy when lyrics toggle.
+     */
+    static void updateVideoCoverBlur(final boolean blur) {
+        if (!Main.sVideoWallpaper) return;
+        Main.main().post(new Runnable() {
+            @Override
+            public void run() {
+                final ImageView iv = Main.sCover;
+                if (iv == null || !Main.sCoverMode) return;
+                if (Main.sVideoCoverBlurred == blur) return;
+                Main.sVideoCoverBlurred = blur;
+                final Bitmap sharp = Main.sCoverBitmap;
+                final Bitmap frosted = Main.sCoverBlurBitmap;
+                if (sharp == null || sharp.isRecycled()) return;
+                if (blur && (frosted == null || frosted.isRecycled())) {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                final Bitmap f = CoverCompose.frosted(sharp);
+                                Main.main().post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (Main.sVideoCoverBlurred && Main.sCover == iv) {
+                                            Main.sCoverBlurBitmap = f;
+                                            applyVideoCoverCrossfade(iv, sharp, f, true);
+                                        } else if (f != null) {
+                                            f.recycle();
+                                        }
+                                    }
+                                });
+                            } catch (Throwable t) {
+                                Xp.log(Main.TAG + "generate frosted on demand failed: " + t);
+                            }
+                        }
+                    }, "mc-cover-blur").start();
+                    return;
+                }
+                Bitmap from = blur ? sharp : (frosted != null ? frosted : sharp);
+                Bitmap to = blur ? (frosted != null ? frosted : sharp) : sharp;
+                applyVideoCoverCrossfade(iv, from, to, blur);
+            }
+        });
+    }
+
+    private static void applyVideoCoverCrossfade(ImageView iv, Bitmap from, Bitmap to, boolean blur) {
+        if (iv == null || from == null || to == null || from == to || from.isRecycled() || to.isRecycled()) {
+            if (iv != null && to != null && !to.isRecycled()) iv.setImageBitmap(to);
+            return;
+        }
+        try {
+            android.graphics.drawable.Drawable[] layers = new android.graphics.drawable.Drawable[]{
+                    new android.graphics.drawable.BitmapDrawable(iv.getResources(), from),
+                    new android.graphics.drawable.BitmapDrawable(iv.getResources(), to)
+            };
+            android.graphics.drawable.TransitionDrawable td =
+                    new android.graphics.drawable.TransitionDrawable(layers);
+            td.setCrossFadeEnabled(true);
+            iv.setImageDrawable(td);
+            int dur = Math.max(150, Math.min(500, (int) coverFadeMs()));
+            td.startTransition(dur);
+            Xp.log(Main.TAG + "video cover crossfading to " + (blur ? "blurred" : "sharp")
+                    + " over " + dur + "ms");
+        } catch (Throwable t) {
+            Xp.log(Main.TAG + "video cover blur crossfade failed: " + t);
+            iv.setImageBitmap(to);
+        }
     }
 
     /**
@@ -333,21 +448,52 @@ final class CoverPush {
         sCoverGuard = new ViewTreeObserver.OnPreDrawListener() {
             @Override
             public boolean onPreDraw() {
+                if (sCoverFadingOut == cover) {
+                    // On the way out. Cover mode is already off, so the rule below would hide
+                    // this view on this very frame - and it is the only thing still over the
+                    // wallpaper window while that window reloads the user's own video. Held up
+                    // until its own fade-out ends; the TextureViews stay hidden under it because
+                    // it is still covering them.
+                    //
+                    // The keyguard is still the condition, though, and that is not a formality:
+                    // the hold can last a second and a half if the wallpaper process has nothing
+                    // to say, and a cover left standing over the desktop is a cover on the
+                    // desktop. Unlocking during the hold drops it on the spot - there is nothing
+                    // left to mask there either, the window has already been handed back.
+                    if (!Main.onKeyguardNow()) {
+                        Xp.log(Main.TAG + "left the lock screen while the cover was fading out");
+                        Main.detachCover();
+                        return true;
+                    }
+                    if (cover.getVisibility() != View.VISIBLE) cover.setVisibility(View.VISIBLE);
+                    hideVideoSurfaces();
+                    return true;
+                }
                 boolean onKeyguard = Main.sCoverMode && Main.onKeyguardNow();
                 int want = onKeyguard ? View.VISIBLE : View.INVISIBLE;
                 if (cover.getVisibility() != want) cover.setVisibility(want);
+                if (onKeyguard) {
+                    // The one place the cover's fade can start from. This runs on the frame the
+                    // cover is really being drawn in, which is the frame the fade is for - the
+                    // push that armed it happens whenever the broadcast does. See
+                    // sCoverFadeWaitMs.
+                    startCoverFade(cover);
+                } else if (cover.getAlpha() < 1f) {
+                    // Off the keyguard the fade is not seen, so it is not spent. An animator left
+                    // running here walks 0..1 behind an INVISIBLE view and is over before the
+                    // cover is shown again - a cover that appears in one frame, which is the
+                    // "there is no fade-in at all" report. Cancel it and owe it again instead, so
+                    // whichever frame the cover comes back on is the one it fades in on.
+                    cover.animate().cancel();
+                    cover.setAlpha(0f);
+                    if (sCoverFadeWaitMs <= 0) sCoverFadeWaitMs = coverFadeMs();
+                }
                 // Our own view is the only thing to write off the lock screen. The wallpaper's
                 // TextureViews belong to MIUI there, and handing them back inside a layer the
                 // shade is drawing is what put a stray frame of the wallpaper into the first
                 // pull-down - setVideoSurfacesHidden() has the measurement.
                 if (!onKeyguard) return true;
-                View bg = Main.sVideoBg, fg = Main.sVideoFg;
-                if (bg != null && bg.getVisibility() != View.INVISIBLE) {
-                    bg.setVisibility(View.INVISIBLE);
-                }
-                if (fg != null && fg.getVisibility() != View.INVISIBLE) {
-                    fg.setVisibility(View.INVISIBLE);
-                }
+                hideVideoSurfaces();
                 return true;
             }
         };
@@ -355,6 +501,331 @@ final class CoverPush {
         sCoverGuarded = cover;
         Xp.log(Main.TAG + "video cover guard installed");
     }
+
+    /**
+     * The cover's fade-in, owed rather than started.
+     *
+     * An alpha animation on a View runs whether or not that View is being drawn, and the guard
+     * above hides the cover on every frame the keyguard is not what is in front - the shade, the
+     * desktop, a rebuild of the keyguard, a re-entry into it. An animator started when the push
+     * happens therefore commonly ran to completion behind an INVISIBLE view, and what the eye got
+     * when the cover was shown was a single-frame appearance with the animation already spent.
+     * That is the whole of "there is no fade-in on the device": the animator was the module's
+     * own, running the whole time, on a view nobody could see.
+     *
+     * So the length is left here and the fade starts on the first frame the cover is genuinely
+     * drawn - from the pre-draw guard, which is the only thing that knows whether it is. Zero
+     * means nothing is owed.
+     *
+     * This only ever moves the module's own ImageView. What the notif card's blur samples is the
+     * wallpaper WINDOW, which FastPlayer paints frame by frame and no View animation reaches -
+     * see the note on showVideoCover().
+     */
+    static volatile long sCoverFadeWaitMs;
+
+    /**
+     * How long the cover's own fade runs, which is the wallpaper's crossfade length and not a
+     * number of its own.
+     *
+     * The same rule the card's stand-in animator and the still path's crossfade already follow:
+     * one fade per transition, derived from the same response curve, so the app's slider moves
+     * all of them together. The wallpaper process is handed this same number (pushFadeMs), and
+     * the cover video it builds runs its own crossfade over it - so the layer the eye sees and
+     * the layer the notif card's blur samples are at least on the same clock, even though the
+     * window's half of it starts later, when the player has the file.
+     */
+    private static long coverFadeMs() {
+        return Main.fadeMsFor(Main.sClockResponse);
+    }
+
+    /** The fade mode by name, for the log and the state dump. See sFadeMode. */
+    static String fadeModeName() {
+        int m = Main.sFadeMode;
+        return m == Main.FADE_MODE_OFF ? "off" : m == Main.FADE_MODE_STRETCH ? "stretch" : "hold";
+    }
+
+    /** Whether the owed fade is being held back for the wallpaper window. See sFadeMode. */
+    static volatile boolean sCoverFadeWaiting;
+    /** When the owed fade was armed, for the gap measurement and the log line. */
+    static volatile long sCoverFadeArmedAt;
+    /** How long the wallpaper window was behind the push last time, for FADE_MODE_STRETCH. */
+    static volatile long sCoverFadeGapMs;
+    /** How often the wallpaper process has said it is reloading, for the state dump. */
+    static volatile int sVideoReloadSignals;
+
+    /**
+     * The bounds on a fade that is matched to the wallpaper process's own timing.
+     *
+     * A floor because a fast reload - a cover video that has not changed, an encode off the cache
+     * - would otherwise leave a 50ms dissolve, which is a cut. A ceiling because a phone that
+     * was busy for a second on one transition must not leave the next one dissolving for a
+     * second and a half.
+     */
+    private static final long COVER_FADE_MIN_MS = 200L, COVER_FADE_MAX_MS = 800L;
+
+    /**
+     * How long the owed fade waits for that word before starting anyway.
+     *
+     * A fallback, not a timer: the cover video's encode is a few hundred milliseconds and the
+     * player's own rebuild sits on top of it, so this is comfortably past both. It is here so
+     * that a phone whose video engine this module never captures - or whose cover video fails to
+     * encode - cannot be left with the cover held at alpha 0 waiting for a message that is not
+     * coming. See releaseCoverFadeWait().
+     */
+    // 1.8s: past the wallpaper process's own first-frame wait (1.5s) so its real signal is
+    // the one that releases the held fade, with this timeout only as the stuck-path floor.
+    private static final long COVER_FADE_SIGNAL_TIMEOUT_MS = 1800L;
+
+    static final Runnable sCoverFadeTimeout = new Runnable() {
+        @Override
+        public void run() {
+            releaseCoverFadeWait("no word from the wallpaper process");
+        }
+    };
+
+    /**
+     * Owes one fade-in for the cover.
+     *
+     * Not started here whatever the mode: the frame the fade belongs to is the one the cover is
+     * next drawn in, which only the pre-draw guard knows. See sCoverFadeWaitMs.
+     */
+    private static void armCoverFade() {
+        long ms = coverFadeMs();
+        if (Main.sFadeMode == Main.FADE_MODE_STRETCH && sCoverFadeGapMs > 0) {
+            // The window's own head start, which is the length that lands this dissolve on top of
+            // the window's swap instead of ~400ms before it.
+            ms = Math.max(COVER_FADE_MIN_MS, Math.min(COVER_FADE_MAX_MS, sCoverFadeGapMs));
+        }
+        sCoverFadeWaitMs = ms;
+        sCoverFadeArmedAt = android.os.SystemClock.uptimeMillis();
+        // The old deadline comes off before the new state is decided, not after: a mode that
+        // does not hold leaves nothing to time out, and an old callback left pending would fire
+        // into whatever transition is running by then.
+        Main.main().removeCallbacks(sCoverFadeTimeout);
+        sCoverFadeWaiting = Main.sFadeMode == Main.FADE_MODE_HOLD;
+        Xp.log(Main.TAG + "cover fade armed: " + ms + "ms, mode=" + fadeModeName()
+                + ", last gap=" + sCoverFadeGapMs + "ms"
+                + (Main.sFadeMode == Main.FADE_MODE_STRETCH && sCoverFadeGapMs <= 0
+                ? " (nothing measured yet, using the crossfade length)" : ""));
+        if (!sCoverFadeWaiting) return;
+        Main.main().postDelayed(sCoverFadeTimeout, COVER_FADE_SIGNAL_TIMEOUT_MS);
+    }
+
+    /**
+     * Lets the owed fade go: the wallpaper window is reloading, or the wait for that word ran
+     * out. Idempotent, and it starts the fade rather than only unblocking it, because the guard
+     * has no other way to be told that the wait is over.
+     */
+    private static void releaseCoverFadeWait(String why) {
+        if (!sCoverFadeWaiting) return;
+        sCoverFadeWaiting = false;
+        Main.main().removeCallbacks(sCoverFadeTimeout);
+        Xp.log(Main.TAG + "cover fade released after "
+                + (android.os.SystemClock.uptimeMillis() - sCoverFadeArmedAt) + "ms ("
+                + why + "), owed " + sCoverFadeWaitMs + "ms");
+        // Which way the transition runs is whichever the cover is owed: the view on its way out
+        // is held by sCoverFadingOut, everything else by the owed fade-in.
+        if (sCoverFadingOut != null) {
+            startCoverFadeOut((ImageView) sCoverFadingOut);
+            return;
+        }
+        startCoverFade(Main.sCover);
+    }
+
+    /**
+     * The one place the wallpaper window's head start is measured: how long after the art was
+     * pushed does this process say the player has been rebuilt. Recorded in every mode, because
+     * FADE_MODE_STRETCH spends the next transition's length on it and is not itself waited on.
+     */
+    static void noteVideoReload() {
+        sVideoReloadSignals++;
+        long gap = android.os.SystemClock.uptimeMillis() - sCoverFadeArmedAt;
+        // Only a fresh one counts: a push that armed nothing (a track change on a view that is
+        // already up and opaque) leaves the timestamp where it was, and the difference from that
+        // would be however long ago the last real transition was.
+        // Fresh, and an entry: the way out has no encode in it, so its reload lands sooner and
+        // measuring the stretch for the next transition off THAT would make the next cover's
+        // dissolve too short.
+        if (sCoverFadingOut == null && sCoverFadeArmedAt > 0 && gap > 0 && gap < 5000L) {
+            sCoverFadeGapMs = gap;
+        }
+        releaseCoverFadeWait("the wallpaper window is reloading");
+    }
+
+    /** Starts the owed fade, if the cover is on screen for it. See sCoverFadeWaitMs. */
+    private static void startCoverFade(final View cover) {
+        long ms = sCoverFadeWaitMs;
+        if (ms <= 0 || cover == null) return;
+        // Held until the wallpaper window says it is reloading, so that the half of the
+        // transition the eye sees and the half the cards' blur samples start together.
+        if (sCoverFadeWaiting) return;
+        if (cover.getVisibility() != View.VISIBLE || !cover.isShown()) return;
+        sCoverFadeWaitMs = 0;
+        cover.setAlpha(0f);
+        cover.animate()
+                .alpha(1f)
+                .setDuration(ms)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .start();
+        Xp.log(Main.TAG + "video cover fading in over " + ms + "ms, alpha "
+                + Main.r2(cover.getAlpha()) + " -> 1");
+    }
+
+    /**
+     * What is really on the lock screen in the video path - the one thing a screenshot cannot
+     * answer.
+     *
+     * Our ImageView and MIUI's own TextureViews are children of the SAME layer, and which of them
+     * the eye is reading is the order they sit in, not the fact that both are VISIBLE. The same
+     * goes for the notif card's blur, which is painted from the wallpaper WINDOW and therefore
+     * cannot be moved by anything we animate here. Reported by the state dump so that "the fade
+     * is not visible" can be answered from the device instead of argued about.
+     */
+    static String describeVideoCover() {
+        StringBuilder out = new StringBuilder();
+        View iv = Main.sCover;
+        if (iv == null) {
+            out.append("no view");
+        } else {
+            ViewGroup parent = iv.getParent() instanceof ViewGroup ? (ViewGroup) iv.getParent() : null;
+            int index = -1, count = 0;
+            if (parent != null) {
+                count = parent.getChildCount();
+                for (int i = 0; i < count; i++) if (parent.getChildAt(i) == iv) index = i;
+            }
+            out.append(visOf(iv)).append(" alpha=").append(Main.r2(iv.getAlpha()))
+               .append(" ").append(iv.getWidth()).append("x").append(iv.getHeight());
+            if (parent != null) {
+                out.append(" child ").append(index + 1).append("/").append(count)
+                   .append(index == count - 1 ? " (top - ours is the visible one)" : " (NOT top - MIUI's is)");
+            } else {
+                out.append(" not in a layer");
+            }
+        }
+        out.append("\n  owed fade=").append(sCoverFadeWaitMs).append("ms")
+           .append(sCoverFadeWaiting ? " (held for the wallpaper window)" : "")
+           .append("; fade mode=").append(fadeModeName())
+           // The measured wallpaper head start, which is also the number the stretch mode spends
+           // on the next transition's dissolve.
+           .append(" (last gap ").append(sCoverFadeGapMs).append("ms)")
+           .append(sCoverFadingOut != null ? " (fading out)" : "")
+           .append("; reload signals=").append(sVideoReloadSignals)
+           .append("; MIUI bg TextureView=").append(visOf(Main.sVideoBg))
+           .append(" alpha=").append(Main.r2(alphaOf(Main.sVideoBg)))
+           .append(" fg TextureView=").append(visOf(Main.sVideoFg))
+           .append(" alpha=").append(Main.r2(alphaOf(Main.sVideoFg)))
+           .append("; lock wallpaper=").append(Main.sVideoWallpaper ? "live (fastplayer)" : "still (texture)");
+        return out.toString();
+    }
+
+    private static String visOf(View v) {
+        if (v == null) return "absent";
+        if (v.getVisibility() == View.VISIBLE) return "VISIBLE";
+        return v.getVisibility() == View.INVISIBLE ? "INVISIBLE" : "GONE";
+    }
+
+    private static float alphaOf(View v) {
+        return v == null ? -1f : v.getAlpha();
+    }
+
+    /**
+     * MIUI's own two TextureViews, hidden while our cover is over them.
+     */
+    private static void hideVideoSurfaces() {
+        View bg = Main.sVideoBg, fg = Main.sVideoFg;
+        if (bg != null && bg.getVisibility() != View.INVISIBLE) {
+            bg.setVisibility(View.INVISIBLE);
+        }
+        if (fg != null && fg.getVisibility() != View.INVISIBLE) {
+            fg.setVisibility(View.INVISIBLE);
+        }
+    }
+
+    /**
+     * The cover on the way out: the view that is already on screen is held and faded out, and
+     * detached when the fade ends.
+     *
+     * The way back for a live wallpaper is a reload - the player is pointed at the user's own
+     * video again and the window changes in one frame, with nothing in this process able to fade
+     * it (the still path has a texture in the wallpaper process it can crossfade there; a video
+     * wallpaper has only its player). Done in one frame that is the whole lock screen changing
+     * at once while the clock is still springing back, which is the same complaint the way in
+     * was fixed for. So the view that is already covering the window is the fade: it is held
+     * until WallpaperProbe says the window is reloading, then it dissolves, and the window's own
+     * cut happens underneath it while it is still opaque.
+     *
+     * Detaching immediately, which is what this used to do, is FADE_MODE_OFF.
+     */
+    private static void armCoverFadeOut() {
+        final ImageView iv = Main.sCover;
+        if (iv == null) {
+            Main.detachCover();
+            return;
+        }
+        if (Main.sFadeMode == Main.FADE_MODE_OFF) {
+            Main.detachCover();
+            return;
+        }
+        sCoverFadingOut = iv;
+        // Nothing is owed to a view that is leaving: the length here is the transition's.
+        sCoverFadeWaitMs = 0;
+        sCoverFadeArmedAt = android.os.SystemClock.uptimeMillis();
+        // Held whatever the mode: on the way out the view has to still be up when the window
+        // swaps back, or the swap is a cut. Only FADE_MODE_OFF, above, skips it.
+        sCoverFadeWaiting = true;
+        Xp.log(Main.TAG + "cover fade-out armed, mode=" + fadeModeName()
+                + (sCoverFadeWaiting ? " (held for the wallpaper window)" : ""));
+        Main.main().removeCallbacks(sCoverFadeTimeout);
+        if (!sCoverFadeWaiting) {
+            startCoverFadeOut(iv);
+            return;
+        }
+        Main.main().postDelayed(sCoverFadeTimeout, COVER_FADE_SIGNAL_TIMEOUT_MS);
+    }
+
+    /** One fade-out, once. See armCoverFadeOut(). */
+    private static void startCoverFadeOut(final ImageView iv) {
+        if (iv == null || sCoverFadingOut != iv) return;
+        if (!iv.isShown() || iv.getAlpha() <= 0f) {
+            sCoverFadingOut = null;
+            // Only if it is still the cover: a keyguard rebuild replaces sCover underneath this,
+            // and detaching whatever is there now would take the lock screen's cover away. Same
+            // guard onCoverFadeOutEnd() has, for the same reason.
+            if (Main.sCover == iv) Main.detachCover();
+            return;
+        }
+        long ms = coverFadeMs();
+        iv.animate().cancel();
+        iv.animate()
+                .alpha(0f)
+                .setDuration(ms)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .withEndAction(() -> onCoverFadeOutEnd(iv))
+                .start();
+        Xp.log(Main.TAG + "video cover fading out over " + ms + "ms");
+    }
+
+    /**
+     * The end of a fade-out. Guarded on the view it was started for: a cover put back up while
+     * this one was dissolving owns sCover, and detaching that one would take the lock screen's
+     * cover away instead.
+     */
+    private static void onCoverFadeOutEnd(final View faded) {
+        if (sCoverFadingOut != faded) return;
+        sCoverFadingOut = null;
+        Main.detachCover();
+        Xp.log(Main.TAG + "video cover faded out");
+    }
+
+    /** The view being faded out on the way back to the wallpaper. See armCoverFadeOut(). */
+    static volatile View sCoverFadingOut;
+
+    /**
+     * Which album is on the cover view, as the 8x8 print artPrint() takes. Compared against the
+     * one the next push carries, so that a track change fades and a re-composition of the same
+     * album (the app's bias slider, a resend after a keyguard rebuild) does not.
+     */
+    static volatile int sShownArtPrint;
 
     /**
      * The live wallpaper's own TextureViews: hidden while the cover is over them, given back

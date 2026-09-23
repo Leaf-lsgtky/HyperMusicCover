@@ -123,6 +123,57 @@ final class LockLyrics {
      */
     private static volatile long sBlurSent;
 
+    /**
+     * How long the lyrics hold back to let the background blur transition settle.
+     * Measured on device: wallpaper FastPlayer reload takes ~150ms-250ms (total ~266ms from broadcast),
+     * and TransitionDrawable / crossfade takes ~300ms-370ms.
+     */
+    private static final long BLUR_ENTER_DELAY_MS = 280L;
+    private static final long BLUR_ENTER_MIN_MS = 200L;
+
+    private static volatile long sBlurStartedAt;
+    private static volatile long sTrackChangedAt;
+    private static volatile boolean sBlurVideoReloaded;
+
+    private static final Runnable BLUR_KICK = new Runnable() {
+        @Override
+        public void run() {
+            LyricView v = sView;
+            if (v != null) v.kick();
+        }
+    };
+
+    private static void scheduleBlurKick(long delayMs) {
+        Main.main().removeCallbacks(BLUR_KICK);
+        Main.main().postDelayed(BLUR_KICK, Math.max(16L, delayMs));
+    }
+
+    static void onVideoReload() {
+        sBlurVideoReloaded = true;
+        LyricView v = sView;
+        if (v != null) v.kick();
+    }
+
+    static boolean blurSettled() {
+        if (!blurWanted()) return true;
+        long now = SystemClock.uptimeMillis();
+        long blurElapsed = now - sBlurStartedAt;
+        if (sBlurStartedAt > 0L && blurElapsed >= 0 && blurElapsed < BLUR_ENTER_DELAY_MS) {
+            if (Main.isVideoWallpaper()) {
+                if (sBlurVideoReloaded && blurElapsed >= BLUR_ENTER_MIN_MS) return true;
+            }
+            return false;
+        }
+        long trackElapsed = now - sTrackChangedAt;
+        if (sTrackChangedAt > 0L && trackElapsed >= 0 && trackElapsed < BLUR_ENTER_DELAY_MS) {
+            if (Main.isVideoWallpaper()) {
+                if (sBlurVideoReloaded && trackElapsed >= BLUR_ENTER_MIN_MS) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
     /** Whether the cover should be frosted right now, for a push to carry over. */
     static boolean blurWanted() {
         return (sBlurSent & 1L) != 0L;
@@ -230,6 +281,10 @@ final class LockLyrics {
      */
     static boolean wantsShown() {
         if (!wantsAttached()) return false;
+        // Hold the band back until the cover's blur transition has settled, so it does not
+        // land over an artwork that is still sharpening. blurSettled() answers true when there
+        // is no blur pending, so the held-AOD path below still shows through untouched.
+        if (!blurSettled()) return false;
         ClockCollapse.Phase p = ClockCollapse.phase();
         if (p == ClockCollapse.Phase.ON || p == ClockCollapse.Phase.ENTER) {
             return Main.screenOnCached();
@@ -425,6 +480,9 @@ final class LockLyrics {
             return;
         }
         sKey = key;
+        sTrackChangedAt = SystemClock.uptimeMillis();
+        sBlurVideoReloaded = false;
+        if (sEnabled && !key.isEmpty()) scheduleBlurKick(BLUR_ENTER_DELAY_MS + 16L);
         // A different song: the budget above is per track, and so is the payload it was spent on.
         sInfoSeen = null;
         sInfoTries = 0;
@@ -684,6 +742,9 @@ final class LockLyrics {
         final int gen = ++sGen;
         sLoading = true;
         sKey = "demo:" + id;
+        sTrackChangedAt = SystemClock.uptimeMillis();
+        sBlurVideoReloaded = false;
+        scheduleBlurKick(BLUR_ENTER_DELAY_MS + 16L);
         setLines(Collections.<LyricLine>emptyList(), "demo loading");
         LyricSource.loadById(id, apple, new LyricSource.Callback() {
             @Override
@@ -754,7 +815,9 @@ final class LockLyrics {
                 + " bandSrc=" + bandSource()
                 + " clockBottom=" + ClockCollapse.contentBottomOnScreen()
                 + " ink=" + ClockCollapse.inkBottomOnScreen()
-                + " shown=" + wantsShown() + " tick=" + sTicking
+                + " shown=" + wantsShown() + " blurSettled=" + blurSettled()
+                + " blurElapsed=" + (sBlurStartedAt > 0 ? (SystemClock.uptimeMillis() - sBlurStartedAt) + "ms" : "none")
+                + " tick=" + sTicking
                 + " view={" + (v == null ? "none" : v.describe()) + "}";
     }
 
@@ -791,9 +854,25 @@ final class LockLyrics {
         boolean on = wanted();
         boolean want = on && (!sLines.isEmpty() || (sLoading && blurWanted()));
         long cur = sBlurSent;
-        if (!again && cur != 0L && ((cur & 1L) != 0L) == want) return;
+        boolean wasOn = (cur & 1L) != 0L;
+        if (!again && cur != 0L && wasOn == want) return;
+        boolean turningOn = want && !wasOn;
         long state = setBlurSent(want);
+        // Video wallpaper needs a moment to reload and cross-fade before the band lands over it;
+        // arm the settle timer when blur turns on, and clear it when it turns off. blurSettled()
+        // reads these to hold wantsShown() back through the transition.
+        if (turningOn) {
+            sBlurStartedAt = SystemClock.uptimeMillis();
+            sBlurVideoReloaded = false;
+            scheduleBlurKick(BLUR_ENTER_DELAY_MS + 16L);
+        } else if (!want) {
+            Main.main().removeCallbacks(BLUR_KICK);
+            sBlurStartedAt = 0L;
+            sTrackChangedAt = 0L;
+            sBlurVideoReloaded = false;
+        }
         CoverPush.sendToWallpaper("lyricblur", want, state >>> 1);
+        CoverPush.updateVideoCoverBlur(want);
         Xp.log(TAG + "cover blur " + (want ? "on" : "off") + (again ? " (told again)" : ""));
     }
 

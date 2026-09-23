@@ -141,6 +141,13 @@ public class Main extends XposedModule {
     static volatile View sVideoBg;
     /** The bitmap currently on sCover, ours to recycle when it is replaced. */
     static volatile Bitmap sCoverBitmap;
+    /** The frosted copy on sCover during lyric display. */
+    static volatile Bitmap sCoverBlurBitmap;
+    static volatile boolean sVideoCoverBlurred;
+
+    static boolean isVideoWallpaper() {
+        return sVideoWallpaper;
+    }
 
     static volatile View sContainer;
     private static volatile Class<?> sContainerCls;
@@ -276,6 +283,22 @@ public class Main extends XposedModule {
      */
     private static volatile float sGlassV0 = Float.NaN, sGlassV1 = Float.NaN;
     private static volatile float sAppliedGlassV = Float.NaN;
+    /**
+     * The glass value the SYSTEM itself last set, caught by the updateGlassValue hook whenever
+     * a call arrives from outside this module. The cover's entry morph used to assume the
+     * pre-cover value was 0 and the exit restored 0 - but the OEM computes this value from the
+     * wallpaper and the clock style, and a restored 0 on a wallpaper whose proper value was
+     * higher leaves the hour glyphs transparent and the minutes under-frosted.
+     */
+    private static volatile float sSystemGlass = Float.NaN;
+    /** True while this module is inside its own updateGlassValue call. */
+    private static volatile boolean sInModuleGlassCall;
+    /**
+     * The cover's entry morph has reached the solid end. While it stands, the glass value is
+     * held there against spurious collapse-progress frames - see applyGlassMorph. Cleared
+     * wherever the glass state itself is.
+     */
+    private static volatile boolean sGlassSettled;
     /** Armed once the HyperLight (统一柔光玻璃) counter-hook is installed; see armMiGlassGuard(). */
     private static volatile boolean sMiGlassGuardArmed;
     /** How many times the counter-hook actually fired on a clock glyph, for the one-line proof. */
@@ -603,6 +626,56 @@ public class Main extends XposedModule {
      * place that holds both pictures; all this decides is whether to ask for it.
      */
     static volatile boolean sFadeWp = true;
+    /**
+     * Whether the COVER VIDEO ITSELF crossfades into the cover, in the wallpaper window.
+     *
+     * Off, and it is off because of what it cost when it was on: measured on the device, the
+     * cards' blurred background stopped switching to the cover at all - the window never showed
+     * the new frame. A cover video with a fade in it is a file of a dozen frames, a frame of the
+     * user's own wallpaper has to be decoded to build it, and both ends of it are converted to
+     * YUV; any of those going wrong leaves the reload at the end of that chain never happening,
+     * while the SystemUI view - which is put up by the other process entirely - goes on showing
+     * the cover. A one-frame cover, which is what this was before the fade existed, cannot fail
+     * that way.
+     *
+     * The lag it was meant to hide is handled where it actually lives: see sFadeMode. Kept as a
+     * switch rather than deleted because the muxer now handles any frame count (checked off the
+     * device: two samples in, byte-identical file out) and this is one adb line to try again.
+     */
+    static volatile boolean sVideoFade;
+    /**
+     * What the cover's own fade does about the wallpaper window's head start, which is the one
+     * thing about a live cover that cannot be fixed by making either half faster.
+     *
+     * The two halves are drawn by different processes and they are not equally fast. This view
+     * gets the composed bitmap immediately; the window under it only changes once the cover
+     * video has been ENCODED, the player rebuilt and its first frame rendered. So a fade that
+     * starts at the push is over before the window has moved at all - which is the whole of the
+     * report that the background and the cards' blurred background arrive at visibly different
+     * moments.
+     *
+     *   FADE_MODE_OFF     - the fade the module always had: our view dissolves in from the
+     *                       push, over the wallpaper's own crossfade length, whatever the window
+     *                       is doing. The eye's background and the cards' blurred background then
+     *                       change at visibly different moments, which is the original report.
+     *   FADE_MODE_HOLD    - waits for WallpaperProbe's signal - sent when the new source's
+     *                       FIRST FRAME is on the window - and only then puts the view up.
+     *                       No dissolve: the view appears over identical content, so the eye's
+     *                       background and the cards' blurred background switch in the same
+     *                       frames. The default; the entry dissolve is gone by request - any
+     *                       fade that runs before the first frame shows the blur stale.
+     *   FADE_MODE_STRETCH - dissolves from the view's first frame, over the last MEASURED gap
+     *                       between the push and the first-frame signal. Kept for A/B.
+     *
+     * On the way OUT the same three apply, but holding is what makes sense there whatever the
+     * mode: the view has to still be up when the window swaps back, or its cut shows.
+     *
+     * The measured gap is persisted, so a restarted SystemUI does not have to relearn it - and
+     * with no measurement at all the stretch falls back to the crossfade length, which is mode
+     * OFF for that one transition.
+     */
+    static final int FADE_MODE_OFF = 0, FADE_MODE_HOLD = 1, FADE_MODE_STRETCH = 2;
+    static volatile int sFadeMode = FADE_MODE_HOLD;
     /**
      * Set when the user tapped their way OUT of cover mode while the card was still up.
      *
@@ -1068,6 +1141,281 @@ public class Main extends XposedModule {
             Xp.log(TAG + "depth ownership hooked");
         } catch (Throwable t) {
             Xp.log(TAG + "depth ownership hook failed: " + t);
+        }
+
+        // The full-screen AOD's wallpaper scale, which is not ours to keep while the cover is up.
+        //
+        // While full AOD is enabled SystemUI holds the LOCK WALLPAPER at 1.05 and walks it
+        // through the doze transition - initDeductedImageScale() sets it, and
+        // resetFullAodAniState() animates it on Folme's "WallpaperParam"/"wallpaperScale" with
+        // KeyguardPanelViewController.transformWallpaperZoomOut() and setWallpaperZoomOut() on
+        // the wallpaper's own window. The whole thing is gated on MiuiFullAodManager
+        // .isWallpaperScaleEnable(), and SystemUI's own answer for a wall paper that is already
+        // moving is no:
+        //
+        //     return isVideoWallPaper() || "sensor".equals(mKeyguardWallpaperType) ? false : true;
+        //
+        // That gate is what the report about video wallpapers is - a video shows no shrink on
+        // the way into full AOD, a still picture does. On the still path our cover IS what the
+        // lock wallpaper holds, so the same animation runs over it, and a scaled-down lock
+        // wallpaper is a lock wallpaper that does not reach the screen's corners: the layer
+        // underneath - the desktop wallpaper, which is a different picture - is what shows
+        // there. With no animation at all there is nothing to see, which is what is wanted.
+        //
+        // So cover mode answers the way a video does. It is a property of the cover, not of the
+        // wallpaper: the flag is read at every transition and on every keyguard rebuild, and
+        // clearing it when the cover goes hands the OEM's own animation back untouched.
+        try {
+            Class<?> aod = Xp.findClass("com.android.keyguard.fullaod.MiuiFullAodManager", cl);
+            Xp.hookAll(aod, "isWallpaperScaleEnable", chain -> {
+                // Test override, `--es op aodgate --ez on true`: answers YES even on a video
+                // wallpaper, which is the only way to rehearse the still-wallpaper shrink on a
+                // device whose wallpaper must not be replaced - setBitmap(FLAG_LOCK) unbinds a
+                // live wallpaper for good. With the override on and the cover OFF, the AOD
+                // transition runs its zoom-out on the live wallpaper exactly as it would on a
+                // still one; with the cover ON, the zoom-out force below swallows every ask and
+                // the screen stays put - which is the whole of the fix, observed end to end.
+                if (sAodGateOverride) return Boolean.TRUE;
+                // Gated on the WALLPAPER KIND, not just the cover: the corner reveal is a video
+                // wallpaper problem (the cover tree sits in the view list the transition
+                // scales). A still wallpaper wears the cover as its own texture - there the
+                // AOD shrink is the system's own behavior and is kept as the user asked.
+                if (sCoverMode && sVideoWallpaper) {
+                    // One line per process, the first time the hook is actually REACHED: the
+                    // concern about this hook was never its logic, it was whether ART inlines
+                    // the final-final gate and the hook never runs at all. Seeing this line
+                    // after a screen-off answers that from the device, not from theory.
+                    if (!sScaleGateSeen) {
+                        sScaleGateSeen = true;
+                        Xp.log(TAG + "full-AOD scale gate reached, cover is up -> answering no");
+                    }
+                    return Boolean.FALSE;
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "full-AOD wallpaper scale hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "full-AOD wallpaper scale hook failed: "
+                    + "(a still cover will shrink with the wallpaper) " + t);
+        }
+
+        // The zoom-out itself, which is the thing that actually shrinks the lock wallpaper.
+        //
+        // isWallpaperScaleEnable() above is only the gate on the code that asks for it, and it
+        // is a final method on a final class called from the same process - exactly the shape
+        // ART is free to inline, which would leave that hook installed and never fired. Measured
+        // on the device: the cover layer still shrinks into full AOD with a still wallpaper, so
+        // that is what happened or the gate is only half of it.
+        //
+        // KeyguardPanelViewController reaches this through a cached java.lang.reflect.Method and
+        // Method.invoke (see its setWallpaperZoom), and a reflective call site cannot be
+        // inlined away - so this is the lever that holds. The value it asks for is
+        // transformWallpaperZoomOut(1.05) = 0.75, i.e. the lock wallpaper drawn a quarter
+        // smaller than the screen, which is a lock wallpaper that does not reach the corners and
+        // a desktop wallpaper showing in them. While the cover is up, that answer is 1.0.
+        //
+        // Forced on the ARGUMENT rather than by refusing the call: the call also carries the
+        // binder token the wallpaper service needs, and the animation that drives it runs for
+        // several frames, so the scale has to be neutralised on every one of them.
+        try {
+            Class<?> wmCls = Xp.findClass("android.app.WallpaperManager", cl);
+            Xp.hookAll(wmCls, "setWallpaperZoomOut", chain -> {
+                Object[] args = chain.getArgs().toArray();
+                if (args.length > 1 && args[1] instanceof Float) {
+                    float asked = (Float) args[1];
+                    // The Folme animation drives this every frame of the transition, so only the
+                    // first sub-1 ask of each one is worth a line.
+                    float prev = sZoomOutLastAsked;
+                    boolean subOne = asked < 1f;
+                    sZoomOutAsks++;
+                    sZoomOutLastAsked = asked;
+                    if (subOne && !(prev < 1f) && sVerbose) {
+                        Xp.log(TAG + "wallpaper zoom-out asked " + asked + " (cover "
+                                + (sCoverMode ? "is up -> forced to 1" : "is off, left alone")
+                                + ")");
+                    }
+                    if (sCoverMode && subOne) {
+                        args[1] = Float.valueOf(1f);
+                        sZoomOutForced++;
+                    }
+                }
+                return chain.proceed(args);
+            });
+            Xp.log(TAG + "wallpaper zoom-out hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "wallpaper zoom-out hook failed (the cover may still shrink into "
+                    + "full AOD): " + t);
+        }
+
+        // The caller, not just the API. The zoom the AOD transition asks for is 0.75, and
+        // dumpsys window's own history shows it arriving at the wallpaper service WITH THE
+        // COVER UP on a screen-off where both hooks above sat idle - the gate hook answered
+        // only on the way OUT of AOD (one log line, a second later) and the WallpaperManager
+        // hook counted nothing. The compiled screen-off call site gets past an interface-gate
+        // hook the JIT has devirtualised, and evidently past the client API hook too, however
+        // that call is dispatched. So the force moves UP one frame, onto the method every one
+        // of those call sites funnels into - decompiled: initDeductedImageScale,
+        // resetFullAodAniState, doWallpaperScaleAnim's listener and the pivot updater all
+        // reach the service through KeyguardPanelViewController.setWallpaperZoom(float), a
+        // method far too large for ART to inline. Forcing its ARGUMENT - the service needs
+        // the call to arrive, just never with a value below one while the cover is up.
+        try {
+            Class<?> kpvc = Xp.findClass("com.android.keyguard.panel.KeyguardPanelViewController", cl);
+            Xp.hookAll(kpvc, "setWallpaperZoom", chain -> {
+                Object[] args = chain.getArgs().toArray();
+                if (args.length == 1 && args[0] instanceof Float) {
+                    float asked = (Float) args[0];
+                    float prev = sZoomLastGateAsked;
+                    sZoomLastGateAsked = asked;
+                    // Same wallpaper-kind gate as the scale animation above: on a still
+                    // wallpaper the cover IS the lock wallpaper texture, and the AOD zoom is
+                    // the system's own behavior there - kept. On the video wallpaper the
+                    // 0.75 zoom was the corner reveal, so it is held at 1.
+                    if (sCoverMode && sVideoWallpaper && asked < 1f) {
+                        if (!(prev < 1f)) {
+                            Xp.log(TAG + "wallpaper zoom " + asked + " while the cover is up"
+                                    + " -> forced to 1 at setWallpaperZoom");
+                        }
+                        args[0] = Float.valueOf(1f);
+                        sZoomGateForced++;
+                        return chain.proceed(args);
+                    }
+                    // Still + cover: the shrink is kept, but the transition's FIRST ask is the
+                    // whole target in one call - a 25% step at screen-off that reads as a
+                    // twitch before the dim has covered anything. Turn that one step into a
+                    // short ramp on the controller's own setter; the small per-frame steps the
+                    // system's animation sends afterwards pass through untouched.
+                    if (sCoverMode && !sVideoWallpaper && asked < 1f
+                            && Math.abs(asked - sStaticZoomLast) > 0.1f) {
+                        final Object ctrl = chain.getThisObject();
+                        final float from = sStaticZoomLast;
+                        final float to = asked;
+                        sStaticZoomLast = asked;
+                        if (sVerbose) {
+                            Xp.log(TAG + "zoom " + from + " -> " + to + " smoothed over 320ms");
+                        }
+                        for (int k = 1; k <= 8; k++) {
+                            final float v = from + (to - from) * k / 8f;
+                            main().postDelayed(() -> {
+                                try {
+                                    Xp.callMethod(ctrl, "setWallpaperZoom", v);
+                                } catch (Throwable ignored) {
+                                }
+                            }, k * 40L);
+                        }
+                        return null;
+                    }
+                    if (sCoverMode && !sVideoWallpaper) {
+                        sStaticZoomLast = asked;
+                    }
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "setWallpaperZoom hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "setWallpaperZoom hook failed (the cover may still shrink into "
+                    + "full AOD): " + t);
+        }
+
+        // The AOD wallpaper-scale ANIMATION, which is a separate mechanism from the zoom above
+        // and the one that was still showing the corners. Decompiling the transition: the
+        // Folme listener drives KeyguardPanelViewController.doDeductedImageScaleAnim once per
+        // frame, and its first act is to scale a list of views to f3 - 0.05 - 0.95 at the
+        // transition's start - with the pivot at 0.5w/0.4h. WHICH list is the whole report:
+        // on a depth video wallpaper it is fullAodAnimationViewsForVideoDepth, the depth
+        // TextureViews, and the cover is not in it - which is why the depth shape never
+        // showed the corners. On every other wallpaper it is animationViews, and the tree the
+        // cover sits in lives there: scaled to 0.95, the cover pulls in from all four edges
+        // and the wallpaper window behind it shows in the corners for the whole animation.
+        // Measured on the device: fullscreen AOD on = corners, AOD off = none, depth = none,
+        // and NOT ONE zoom call in dumpsys during any of it - the zoom this file already
+        // pins was never the mechanism that showed the corners.
+        //
+        // While the cover is up the animation does not run at all. Skipping the whole method
+        // also drops its ungated setKeyguardMatrixAndAlpha tail, which scales the keyguard
+        // window itself behind the same unreliable gate.
+        try {
+            Class<?> kpvc2 = Xp.findClass(
+                    "com.android.keyguard.panel.KeyguardPanelViewController", cl);
+            Xp.hookAll(kpvc2, "doDeductedImageScaleAnim", chain -> {
+                // Only the VIDEO wallpaper's cover loses the scale animation: on it the view
+                // list being scaled contains the cover's tree, and 0.95 is the corner reveal.
+                // A still wallpaper wears the cover as its own texture, so the transition's
+                // scale animation is the system's own AOD behavior and stays, as the user asked.
+                if (!sCoverMode || !sVideoWallpaper) return chain.proceed();
+                if (!sDeductAnimSeen) {
+                    sDeductAnimSeen = true;
+                    Xp.log(TAG + "AOD wallpaper-scale animation reached with the cover up"
+                            + " - skipped (this was the corner reveal)");
+                }
+                return null;
+            });
+            Xp.log(TAG + "AOD wallpaper-scale animation hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "AOD wallpaper-scale animation hook failed (the corners may still"
+                    + " show at screen-off): " + t);
+        }
+
+        // The AOD's wallpaper dim. doWallpaperBlackAnim animates "wallpaperBlack" and lands it
+        // through ViewRootImpl.setWallpaperBlack(float) - a MIUI channel that reaches the
+        // wallpaper window itself. The value, and whether the window stays dimmed, survive a
+        // cover's rebuild normally - but our reload resets the wallpaper-side render state, and
+        // with the cover up the dim was observed to vanish into AOD. Remember the value and the
+        // root it was set on; the first-frame signal re-asserts both. See reassertAodDim().
+        try {
+            Class<?> vri = Xp.findClass("android.view.ViewRootImpl", cl);
+            Xp.hookAll(vri, "setWallpaperBlack", chain -> {
+                Object[] args = chain.getArgs().toArray();
+                if (args.length == 1 && args[0] instanceof Float) {
+                    float v = (Float) args[0];
+                    if (v != sLastWallpaperBlack) {
+                        sLastWallpaperBlack = v;
+                        sBlackRoot = chain.getThisObject();
+                        if (sVerbose) {
+                            Xp.log(TAG + "wallpaperBlack=" + v + " on "
+                                    + (sBlackRoot == null ? "null" : sBlackRoot.getClass()
+                                    .getSimpleName()));
+                        }
+                    }
+                }
+                return chain.proceed();
+            });
+            Xp.log(TAG + "wallpaperBlack hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "wallpaperBlack hook failed (the cover may sit bright in AOD): " + t);
+        }
+
+        // The clock's glass value, as the SYSTEM sets it. The cover's morph drives this same
+        // method with its own numbers, and its exit used to restore 0 - the value this module
+        // assumed the lockscreen was inked with. The OEM computes the value from the wallpaper
+        // and the clock style, and a restored 0 on a wallpaper whose proper value was higher
+        // leaves the hour glyphs transparent and the minutes under-frosted. Observe every call
+        // that is not ours; enterCoverMode and the restore paths start from what was recorded.
+        for (String clockCls : new String[]{
+                "com.miui.clock.allInOne.AllInOneBase",
+                "com.android.keyguard.clock.animation.ColorAnimationBaseClock"}) {
+            try {
+                Class<?> cc = Xp.findClass(clockCls, cl);
+                Xp.hookAll(cc, "updateGlassValue", chain -> {
+                    if (!sInModuleGlassCall) {
+                        Object[] a = chain.getArgs().toArray();
+                        if (a.length == 1 && a[0] instanceof Float
+                                && !Float.isNaN((Float) a[0])) {
+                            float v = (Float) a[0];
+                            if (v != sSystemGlass) {
+                                sSystemGlass = v;
+                                if (sVerbose) {
+                                    Xp.log(TAG + "system glass value = " + v);
+                                }
+                            }
+                        }
+                    }
+                    return chain.proceed();
+                });
+                Xp.log(TAG + "system glass hooked on " + cc.getSimpleName());
+            } catch (Throwable t) {
+                Xp.log(TAG + "system glass hook failed on " + clockCls + ": " + t);
+            }
         }
 
         // The fingerprint ring, when the user has asked for it to go. Two hooks, because the
@@ -1574,6 +1922,11 @@ public class Main extends XposedModule {
                     + "\ntap=" + (sTapToggle ? 1 : 0)
                     + ShadeLayer.dumpCfg()
                     + "\nfadewp=" + (sFadeWp ? 1 : 0)
+                    + "\nvcfade=" + (sVideoFade ? 1 : 0)
+                    + "\nfadesync=" + sFadeMode
+                    // A measurement rather than a setting, and kept for the same reason the
+                    // geometry is: a fresh SystemUI should not have to relearn it to use it.
+                    + "\ncovergap=" + CoverPush.sCoverFadeGapMs
                     + "\nhidefp=" + (sHideFp ? 1 : 0)
                     + "\naodsmall=" + (sAodSmall ? 1 : 0)
                     + "\ncolon=" + (HyperTweaks.sForceColon ? 1 : 0)
@@ -1676,6 +2029,9 @@ public class Main extends XposedModule {
                         else if ("mctap".equals(k)) sMcTitleTap = "1".equals(v);
                         else if ("tap".equals(k)) sTapToggle = "1".equals(v);
                         else if ("fadewp".equals(k)) sFadeWp = "1".equals(v);
+                        else if ("vcfade".equals(k)) sVideoFade = "1".equals(v);
+                        else if ("fsmode2".equals(k)) sFadeMode = Integer.parseInt(v);
+                        else if ("covergap".equals(k)) CoverPush.sCoverFadeGapMs = Long.parseLong(v);
                         else if ("hidefp".equals(k)) sHideFp = "1".equals(v);
                         else if ("aodsmall".equals(k)) sAodSmall = "1".equals(v);
                         else if ("colon".equals(k)) HyperTweaks.sForceColon = "1".equals(v);
@@ -2151,6 +2507,46 @@ public class Main extends XposedModule {
                         sFadeWp = i.getBooleanExtra("on", !sFadeWp);
                         saveState();
                         Xp.log(TAG + "wallpaper crossfade " + (sFadeWp ? "on" : "off"));
+                    } else if ("vcfade".equals(op)) {
+                        // Off by default: see the note on sVideoFade. Setting it here re-pushes
+                        // the art, because the cover video that is on the device right now was
+                        // built with whichever value was in force when it was pushed.
+                        sVideoFade = i.getBooleanExtra("on", !sVideoFade);
+                        saveState();
+                        Xp.log(TAG + "cover video crossfade " + (sVideoFade ? "on" : "off")
+                                + (sCoverMode ? " - re-pushing the art" : ""));
+                        if (sCoverMode) CoverPush.pushArtAsync(true, false);
+                    } else if ("fadesync".equals(op)) {
+                        // --ei mode 0|1|2 picks one; with no mode it cycles, so the three can be
+                        // compared on the phone with one command instead of three builds.
+                        int mode = i.getIntExtra("mode", -1);
+                        sFadeMode = mode >= 0 && mode <= FADE_MODE_STRETCH
+                                ? mode : (sFadeMode + 1) % (FADE_MODE_STRETCH + 1);
+                        saveState();
+                        Xp.log(TAG + "cover fade mode = " + CoverPush.fadeModeName()
+                                + " (0 off, 1 hold for the wallpaper window, 2 stretch by the"
+                                + " last measured gap " + CoverPush.sCoverFadeGapMs + "ms)");
+                    } else if ("videoreload".equals(op)) {
+                        // From WallpaperProbe, sent from inside the call that rebuilds the video
+                        // player - and also from the paths where no reload is coming at all, so
+                        // that the cover is never held for a message that will not arrive. See
+                        // noteVideoReload() and sFadeMode.
+                        CoverPush.noteVideoReload();
+                        // The window's content changes a few hundred ms AFTER this message, on
+                        // the wallpaper side, with nothing in this process asking for a frame -
+                        // and the notif cards' frosted backdrop re-samples what is behind them
+                        // only when this window redraws. Left alone it keeps serving the last
+                        // frame it sampled while the wallpaper under it has already swapped,
+                        // which is the report that the blur arrives half a beat late. Pump
+                        // redraws until the swap has certainly landed. See startBlurSync().
+                        startBlurSync(i.getStringExtra("why"));
+                        LockLyrics.onVideoReload();
+                        // The rebuild also resets the wallpaper-side render state, and with it
+                        // the AOD's wallpaper dim (set through setWallpaperBlack /
+                        // setWallPaperAnimProcess - see sLastWallpaperBlack). Re-assert it once
+                        // the first frame is up, or the cover sits in AOD at full brightness
+                        // while the wallpaper next to it would have been dimmed.
+                        if (sCoverMode) reassertAodDim();
                     } else if ("tap".equals(op)) {
                         sTapToggle = i.getBooleanExtra("on", !sTapToggle);
                         saveState();
@@ -2217,6 +2613,7 @@ public class Main extends XposedModule {
                             sCoverWanted = false;
                             setCoverEnabled(false, false, false);
                         }
+
                     } else if ("callclock".equals(op)) {
                         callOnClockViews(i.getStringExtra("m"), i.getStringExtra("kind"),
                                 i.getFloatExtra("f", 0f), i.getIntExtra("n", 0),
@@ -2289,6 +2686,8 @@ public class Main extends XposedModule {
                         out.putBoolean("mctap", sMcTitleTap);
                         out.putBoolean("tap", sTapToggle);
                         out.putBoolean("fadewp", sFadeWp);
+                        out.putInt("fsmode2", sFadeMode);
+                        out.putBoolean("vcfade", sVideoFade);
                         out.putBoolean("hidefp", sHideFp);
                         out.putBoolean("aodsmall", sAodSmall);
                         out.putBoolean("colon", HyperTweaks.sForceColon);
@@ -2340,6 +2739,8 @@ public class Main extends XposedModule {
                         // Logged as well as answered: an adb run of this op should not have to
                         // go through the app to see it.
                         for (String line : report.split("\n")) Xp.log(TAG + line);
+                    } else if ("vtree".equals(op)) {
+                        dumpViewTree();
                     } else if ("bounds".equals(op)) {
                         dumpClockBounds();
                     } else if ("geom".equals(op)) {
@@ -2371,6 +2772,11 @@ public class Main extends XposedModule {
                         sVerbose = i.getBooleanExtra("on", !sVerbose);
                         LockLyrics.verbose = sVerbose;
                         Xp.log(TAG + "verbose=" + sVerbose);
+                    } else if ("aodgate".equals(op)) {
+                        sAodGateOverride = i.getBooleanExtra("on", !sAodGateOverride);
+                        Xp.log(TAG + "aod scale gate override=" + sAodGateOverride
+                                + (sAodGateOverride ? " (the AOD zoom will run on a video"
+                                + " wallpaper too - rehearsal mode)" : ""));
                     } else {
                         Xp.log(TAG + "unknown op " + op);
                     }
@@ -2459,6 +2865,19 @@ public class Main extends XposedModule {
                     else if (sVideoWpOwed) setDepthHidden(false);
                     if (sCoverMode) applyMediaCard();
                     return;
+                }
+                if (Intent.ACTION_USER_PRESENT.equals(a)) {
+                    if (sVideoWallpaper || sCoverMode) {
+                        Intent out = CoverPush.wallpaperIntent("keyguard_state");
+                        out.putExtra("showing", false);
+                        c.sendBroadcast(out);
+                    }
+                } else if (Intent.ACTION_SCREEN_OFF.equals(a) || Intent.ACTION_SCREEN_ON.equals(a)) {
+                    if (sVideoWallpaper || sCoverMode) {
+                        Intent out = CoverPush.wallpaperIntent("keyguard_state");
+                        out.putExtra("showing", true);
+                        c.sendBroadcast(out);
+                    }
                 }
                 // Cover mode outlives the display going off and the phone being unlocked; its
                 // grip on the clock does not. The AOD shows the full clock - the AOD's clock is
@@ -4511,6 +4930,14 @@ public class Main extends XposedModule {
           .append(" card=").append(sCardKnown ? (sCardShowing ? "showing" : "gone") : "unknown")
           .append(" keyguard=").append(onKeyguardNow())
           .append(" videoWallpaper=").append(sVideoWallpaper)
+          // The AOD transition's wallpaper zoom-out: how often it was asked for, how often it
+          // was forced back to 1 because the cover is up, and the last value seen. The lever
+          // behind "the corners show the desktop wallpaper while the cover is on".
+          .append("\nzoomOut: asks=").append(sZoomOutAsks)
+          .append(" forced=").append(sZoomOutForced)
+          .append(" last=").append(Float.isNaN(sZoomOutLastAsked) ? "none"
+                  : String.valueOf(r2(sZoomOutLastAsked)))
+          .append("\nvideo cover: ").append(CoverPush.describeVideoCover())
           .append("\nhold: y=").append(sHoldY)
           .append(" lastSystem=").append(r1(sLastSystemY))
           .append("\nclock: ").append(ClockCollapse.describe()).append('\n')
@@ -5321,6 +5748,195 @@ public class Main extends XposedModule {
 
     /** A hand-back of the live wallpaper's surfaces that is waiting for a lock screen. */
     static volatile boolean sVideoWpOwed;
+
+    /**
+     * What the AOD transition has been asking the wallpaper to do.
+     *
+     * The shrink the cover is not allowed to have comes from one call - the wallpaper zoom-out -
+     * and whether it still happens is otherwise only visible as "the corners show the desktop
+     * wallpaper". These are the counters the state dump prints, so the question can be answered
+     * from a dump instead of by eye: anything asked (< 1) while the cover is up is forced back to
+     * 1, and a forced count that stays zero through a screen-off means this is not the lever
+     * that was shrinking it.
+     */
+    private static volatile int sZoomOutAsks, sZoomOutForced;
+    /** Set the first time the scale-gate hook is actually reached with the cover up. */
+    private static volatile boolean sScaleGateSeen;
+    /** How often setWallpaperZoom was reached with a sub-1 ask while the cover was up. */
+    private static volatile int sZoomGateForced;
+    private static volatile float sZoomLastGateAsked = Float.NaN;
+    /** Set the first time the AOD scale animation is reached with the cover up. */
+    private static volatile boolean sDeductAnimSeen;
+    /** The last zoom applied on the still-wallpaper cover path, for the entry smoothing. */
+    private static volatile float sStaticZoomLast = 1.0f;
+    /** The AOD wallpaper-dim value the system last set, and the root it was set on. */
+    private static volatile float sLastWallpaperBlack = -1f;
+    private static volatile Object sBlackRoot;
+    /** How often the wallpaper process said its zoom endpoint was forced back to 1. */
+    private static volatile int sWpZoomForced;
+    /**
+     * Test override for the scale gate, `--es op aodgate --ez on true`. Rehearses the
+     * still-wallpaper shrink on a live wallpaper without touching the wallpaper itself.
+     */
+    private static volatile boolean sAodGateOverride;
+    private static volatile float sZoomOutLastAsked = Float.NaN;
+
+    /**
+     * How long the blur-sync pump keeps the keyguard redrawing after a reload signal.
+     *
+     * Long enough to cover the slowest measured swap: the wallpaper process rebuilds its player
+     * and the first frame lands somewhere between 60ms (a cover video off the encode cache) and
+     * ~700ms (restoring the user's own 4K wallpaper video, re-seeked) after the reload. Past
+     * that, a swap that arrives late simply does not get re-sampled by the cards' blur.
+     */
+    private static final long BLUR_SYNC_MS = 1400L;
+
+    private static volatile long sBlurSyncUntil;
+    private static volatile boolean sBlurSyncPumping;
+
+    /**
+     * Keeps the keyguard window redrawing, one frame at a time, until the wallpaper window's
+     * swap has certainly landed.
+     *
+     * The cards' frosted backdrop is not a live view of the wallpaper: it re-samples what is
+     * behind the cards only when this window draws a frame. Every cover transition ends with
+     * this window going quiet BEFORE the wallpaper side has finished - the cover's view has
+     * faded out and detached, or the fade-in is over, and the player's first frame is still
+     * being decoded - so the last backdrop sample, taken while the view was still up, is what
+     * stays on the cards while the wallpaper window underneath swaps. The eye sees the new
+     * wallpaper; the cards keep the old blur. That is the whole of the "half a beat late"
+     * report, and no View animation on our side can fix it, because the missing ingredient is
+     * not motion - it is a frame for the blur to re-sample in.
+     *
+     * So the pump draws those frames on purpose. One invalidate a vsync, from the signal that
+     * says the player was rebuilt until well past the slowest first frame. The cost is a
+     * redraw a frame for about a second, which is the same cost the still path's crossfade
+     * already pays; the alternative is the cards disagreeing with the wallpaper they sit on.
+     */
+    private static final android.view.Choreographer.FrameCallback sBlurSyncFrame =
+            new android.view.Choreographer.FrameCallback() {
+                @Override
+                public void doFrame(long frameTimeNanos) {
+                    sBlurSyncPumping = false;
+                    if (android.os.SystemClock.uptimeMillis() >= sBlurSyncUntil) return;
+                    View root = sContainer == null ? null : sContainer.getRootView();
+                    if (root != null) root.invalidate();
+                    sBlurSyncPumping = true;
+                    android.view.Choreographer.getInstance().postFrameCallback(this);
+                }
+            };
+
+    private static void startBlurSync(String why) {
+        long now = android.os.SystemClock.uptimeMillis();
+        boolean fresh = now >= sBlurSyncUntil;
+        sBlurSyncUntil = now + BLUR_SYNC_MS;
+        if (sBlurSyncPumping) return;
+        sBlurSyncPumping = true;
+        android.view.Choreographer.getInstance().postFrameCallback(sBlurSyncFrame);
+        // One line per burst, not per frame: the pump runs for over a thousand frames.
+        Xp.log(TAG + "blur sync pumping " + BLUR_SYNC_MS + "ms (" + why + ")"
+                + (fresh ? "" : " (extended)"));
+    }
+
+    /**
+     * Re-applies the AOD wallpaper dim after a cover rebuild. The rebuild recreates the
+     * wallpaper-side render pipeline, and the dim the system had animated onto the wallpaper
+     * window - through setWallpaperBlack and the WallPaperAnimProcess transaction - is state
+     * that pipeline does not carry across. Left alone, the cover sits in AOD at full
+     * brightness where the wallpaper would have been dimmed. Three re-asserts spread over
+     * 600ms: the new GL program can land after the first of them.
+     */
+    private static void reassertAodDim() {
+        final float black = sLastWallpaperBlack;
+        final Object root = sBlackRoot;
+        if (black < 0f) return;
+        for (final long at : new long[]{50L, 250L, 600L}) {
+            main().postDelayed(() -> {
+                if (!sCoverMode) return;
+                try {
+                    if (root != null) {
+                        Xp.callMethod(root, "setWallpaperBlack", black);
+                    }
+                    android.view.SurfaceControl.Transaction t =
+                            new android.view.SurfaceControl.Transaction();
+                    try {
+                        Xp.callMethod(t, "enableWallPaperAnim", true);
+                        Xp.callMethod(t, "setWallPaperAnimProcess", black);
+                    } catch (Throwable ignored) {
+                    }
+                    t.apply();
+                    Xp.log(TAG + "aod dim re-asserted " + black + " (+" + at + "ms)");
+                } catch (Throwable t2) {
+                    Xp.log(TAG + "aod dim re-assert failed: " + t2);
+                }
+            }, at);
+        }
+    }
+
+
+    private static int sVtreeLines;
+
+    /**
+     * PROBE: the keyguard window's whole view tree, one line per view - class, id, visibility,
+     * alpha, size - with TextureViews and SurfaceViews marked. This is the ground truth behind
+     * "the cover is up but the screen does not show it": the state dump reads our view's own
+     * flags, and they can all say VISIBLE while the layer the view sits in is not what the eye
+     * is looking at.
+     */
+    private static void dumpViewTree() {
+        try {
+            View v = sContainer;
+            if (v == null) {
+                Xp.log(TAG + "vtree: no clock container");
+                return;
+            }
+            sVtreeLines = 0;
+            StringBuilder sb = new StringBuilder();
+            walkTree(v.getRootView(), 0, sb);
+            String s = sb.toString();
+            int start = 0;
+            while (start < s.length()) {
+                int nl = s.indexOf('\n', start);
+                if (nl < 0) nl = s.length();
+                Xp.log(TAG + "vtree " + s.substring(start, nl));
+                start = nl + 1;
+            }
+            Xp.log(TAG + "vtree done, " + sVtreeLines + " views");
+        } catch (Throwable t) {
+            Xp.log(TAG + "vtree failed: " + t);
+        }
+    }
+
+    private static void walkTree(View v, int depth, StringBuilder sb) {
+        if (sVtreeLines > 400) return;
+        sVtreeLines++;
+        for (int i = 0; i < depth; i++) sb.append("  ");
+        String cls = v.getClass().getSimpleName();
+        if (cls.isEmpty()) cls = v.getClass().getName();
+        sb.append(cls).append('#').append(resourceName(v))
+          .append(" vis=").append(v.getVisibility())
+          .append(" a=").append(r2(v.getAlpha()))
+          .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+          .append(" tl=").append((int) v.getX()).append(',').append((int) v.getY());
+        if (v instanceof android.view.TextureView) sb.append(" <<TEXTUREVIEW>>");
+        if (v instanceof android.view.SurfaceView) sb.append(" <<SURFACEVIEW>>");
+        if (v == sCover) sb.append(" <<COVER>>");
+        sb.append('\n');
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) walkTree(g.getChildAt(i), depth + 1, sb);
+        }
+    }
+
+    private static String resourceName(View v) {
+        try {
+            int id = v.getId();
+            if (id <= 0 || id == View.NO_ID) return "-";
+            return v.getResources().getResourceEntryName(id);
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
 
     /**
      * FLAG_RECEIVER_FOREGROUND is the whole reason a track change feels immediate: without it
@@ -8254,12 +8870,22 @@ public class Main extends XposedModule {
         }
         final ImageView iv = sCover;
         sCover = null;
+        // Nothing is owed to a view that is going away: a fade armed for it would otherwise be
+        // picked up by whatever the guard sees next, and a wait still outstanding would outlive
+        // the cover it was armed for.
+        CoverPush.sCoverFadeWaitMs = 0;
+        CoverPush.sCoverFadeWaiting = false;
+        CoverPush.sCoverFadingOut = null;
+        // The view is going, so it shows nothing: the next push owes a fade whatever it carries.
+        CoverPush.sShownArtPrint = 0;
+        main().removeCallbacks(CoverPush.sCoverFadeTimeout);
         if (iv == null) return;
         iv.post(new Runnable() {
             @Override
             public void run() {
                 try {
                     CoverPush.releaseCoverGuard();
+                    iv.animate().cancel();
                     ViewGroup p = (ViewGroup) iv.getParent();
                     if (p != null) p.removeView(iv);
                     iv.setImageDrawable(null);
@@ -8268,6 +8894,10 @@ public class Main extends XposedModule {
                     Bitmap b = sCoverBitmap;
                     sCoverBitmap = null;
                     if (b != null) b.recycle();
+                    Bitmap fb = sCoverBlurBitmap;
+                    sCoverBlurBitmap = null;
+                    if (fb != null && fb != b) fb.recycle();
+                    sVideoCoverBlurred = false;
                     // The live wallpaper was only hidden because this view was covering it.
                     // Whatever removed the view - an exit, a keyguard rebuild, a failure part
                     // way through - the wallpaper has to come back with it, or the lock screen
@@ -9048,15 +9678,32 @@ public class Main extends XposedModule {
         // tint a moment later, every time. The placement is ours; the colour is not.
         if (!sScreenOn) return;
         float g = sGlassV0 + p * (sGlassV1 - sGlassV0);
+        // While the cover is up, the clock's glass belongs at the solid end. The collapse
+        // progress p is read from the OEM's notifY, and a single frame of it reading the
+        // natural position - a keyguard rebuild, a wake, a notification relayout - drags the
+        // glass back toward the transparent end, where the hour glyphs vanish over the cover.
+        // The placement recovers on the next driven frame; the glass does not - it freezes at
+        // whatever was applied last, and that is exactly the broken clock being reported. So
+        // once the entry morph has reached the solid end, the value holds there until cover
+        // mode itself goes.
+        if (sCoverMode) {
+            if (g >= sGlassV1 - 0.01f) sGlassSettled = true;
+            if (sGlassSettled) g = sGlassV1;
+        }
         if (!Float.isNaN(sAppliedGlassV) && Math.abs(g - sAppliedGlassV) < 0.004f) return;
         sAppliedGlassV = g;
-        for (View root : clockRoots()) {
-            try {
-                View c = ((android.view.ViewGroup) root).getChildAt(0);
-                if (c == null) continue;
-                Xp.callMethod(c, "updateGlassValue", g);
-            } catch (Throwable ignored) {
+        sInModuleGlassCall = true;
+        try {
+            for (View root : clockRoots()) {
+                try {
+                    View c = ((android.view.ViewGroup) root).getChildAt(0);
+                    if (c == null) continue;
+                    Xp.callMethod(c, "updateGlassValue", g);
+                } catch (Throwable ignored) {
+                }
             }
+        } finally {
+            sInModuleGlassCall = false;
         }
     }
 

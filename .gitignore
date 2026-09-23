@@ -27,3 +27,8 @@ local.properties
 # The release-notes draft, fed to `git tag -F`. Local only, like HANDOFF.md; the tag message
 # is what actually publishes the notes, so this file must never be committed.
 /日志.txt
+
+# The agent's per-session memory - the same category as HANDOFF.md: running notes on what
+# was tried, device quirks, and round-by-round debugging history. For whoever (whatever)
+# picks this up next, not for the repo's readers.
+/.workbuddy/
