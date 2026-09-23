@@ -313,6 +313,9 @@ public class Main extends XposedModule {
      * that belonged to another frame. What goes back is what the OEM last asked for.
      */
     private static volatile View sDeductedRef;
+    /** PROBE: the OEM object that owns the cut-out, for vcprobe's reading of its switches. */
+    private static volatile Object sDepthInteractor;
+
     private static volatile int sDeductedWanted = -1;
     private static volatile boolean sDeductedHeld;
     private static volatile boolean sOwnDepthWrite;
@@ -1131,6 +1134,7 @@ public class Main extends XposedModule {
             Class<?> depth = Xp.findClass(
                     "com.android.keyguard.depth.KeyguardDepthInteractor", cl);
             Xp.hookAll(depth, "updateDeductedImageView", chain -> {
+                sDepthInteractor = chain.getThisObject();
                 Object result = chain.proceed();
                 if (sDepthHidden) {
                     try {
@@ -2000,7 +2004,22 @@ public class Main extends XposedModule {
                                 + " drawable=" + (dd instanceof ImageView
                                 ? ((ImageView) dd).getDrawable() : "-"))
                                 + " depthHidden=" + sDepthHidden + " oemWants=" + sDeductedWanted
-                                + " held=" + sDeductedHeld);
+                                + " held=" + sDeductedHeld
+                                + " | fgNow " + layerState(CoverPush.videoSurfaceView("keyguard_foreground_layer"))
+                                + " | bgNow " + layerState(CoverPush.videoSurfaceView("keyguard_background_layer"))
+                                + " | deducted " + layerState(dd)
+                                + " | oem " + depthFlags());
+                    } else if ("layer".equals(op)) {
+                        // One of MIUI's three wallpaper layers set to a visibility, once, so the
+                        // screen says which one is drawing what. which = fg | bg | deducted.
+                        String which = i.getStringExtra("which");
+                        View lv = "deducted".equals(which) ? findDeductedImageView()
+                                : "bg".equals(which) ? CoverPush.videoSurfaceView("keyguard_background_layer")
+                                : CoverPush.videoSurfaceView("keyguard_foreground_layer");
+                        if (lv != null) {
+                            lv.setVisibility(i.getBooleanExtra("hide", true) ? View.INVISIBLE : View.VISIBLE);
+                        }
+                        setResultData(which + " " + layerState(lv));
                     } else if ("uncover".equals(op)) {
                         // Hides our cover view only, leaving MIUI's layers as they are, so a
                         // screenshot shows what is under it. See CoverPush.guardVideoCover.
@@ -7499,6 +7518,49 @@ public class Main extends XposedModule {
             d.getViewTreeObserver().removeOnPreDrawListener(g);
         } catch (Throwable ignored) {
         }
+    }
+
+    /** The OEM depth interactor's own switches, read by reflection. */
+    private static String depthFlags() {
+        Object o = sDepthInteractor;
+        if (o == null) return "interactor not seen yet";
+        StringBuilder sb = new StringBuilder();
+        for (String f : new String[] {"depthEffectEnableInner", "depthVideoEnable",
+                "isActualDisplayDepth", "isDepthFileParsing"}) {
+            try {
+                java.lang.reflect.Field fl = o.getClass().getDeclaredField(f);
+                fl.setAccessible(true);
+                sb.append(f).append('=').append(fl.get(o)).append(' ');
+            } catch (Throwable t) {
+                sb.append(f).append("=? ");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** What decides whether a view reaches the screen: its own state and its parents'. */
+    private static String layerState(View v) {
+        if (v == null) return "absent";
+        StringBuilder sb = new StringBuilder();
+        sb.append("vis=").append(v.getVisibility()).append(" a=").append(r2(v.getAlpha()))
+                .append(" ta=").append(r2(v.getTransitionAlpha()))
+                .append(" shown=").append(v.isShown())
+                .append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+        if (v instanceof ImageView) {
+            android.graphics.drawable.Drawable d = ((ImageView) v).getDrawable();
+            if (d instanceof android.graphics.drawable.BitmapDrawable) {
+                Bitmap b = ((android.graphics.drawable.BitmapDrawable) d).getBitmap();
+                sb.append(" bmp=").append(b == null ? "null" : b.getWidth() + "x" + b.getHeight()
+                        + "@" + Integer.toHexString(System.identityHashCode(b)));
+            }
+        }
+        int depth = 0;
+        for (android.view.ViewParent p = v.getParent(); p instanceof View && depth < 3; p = p.getParent(), depth++) {
+            View pv = (View) p;
+            sb.append(" <").append(idName(pv)).append(" vis=").append(pv.getVisibility())
+                    .append(" a=").append(r2(pv.getAlpha()));
+        }
+        return sb.toString();
     }
 
     private static View findDeductedImageView() {

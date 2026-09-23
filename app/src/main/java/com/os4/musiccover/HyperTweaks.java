@@ -469,10 +469,30 @@ final class HyperTweaks {
             Field enableInner = interactorField.getType().getDeclaredField("depthEffectEnableInner");
             enableInner.setAccessible(true);
             Method updateElements = panelCls.getMethod("updateKeyguardElementsVisibility");
+            Field videoEnable = interactorField.getType().getDeclaredField("depthVideoEnable");
+            videoEnable.setAccessible(true);
+            Method updateCrop = interactorField.getType().getMethod("updateDeductedImageView");
             Xp.hookAll(panelCls, "updateShowDepthState", chain -> {
                 Object panel = chain.getThisObject();
-                depthEnable.setBoolean(panel, true);
+                sKgPanel = panel;
                 Object interactor = interactorField.get(panel);
+                if (videoEnable.getBoolean(interactor)) {
+                    // A depth VIDEO is left to the OEM. Its subject is the video's own cut-out
+                    // surface; the two flags forced below are the STILL depth path, which decodes
+                    // the theme's crop of the video's last frame into deducted_image_view and
+                    // leaves it standing over the video - and over the AOD, where nothing on the
+                    // video path ever fades it: a sheep and a tuft of grass on a black screen.
+                    // Only the OEM's own value (false: the video type is not 2) goes back, and
+                    // the crop an earlier forced pass decoded is cleared the OEM's way.
+                    if (enableInner.getBoolean(interactor)) {
+                        depthEnable.setBoolean(panel, false);
+                        enableInner.setBoolean(interactor, false);
+                        updateCrop.invoke(interactor);
+                        Xp.log(TAG + "depth video: still depth path handed back");
+                    }
+                    return chain.proceed();
+                }
+                depthEnable.setBoolean(panel, true);
                 enableInner.setBoolean(interactor, true);
                 Object result = chain.proceed();
                 if (!actualDisplay.getBoolean(interactor)) {
@@ -485,7 +505,39 @@ final class HyperTweaks {
         } catch (Throwable t) {
             failed("depth-panel-state", t);
         }
+        // The panel's first pass can come before the interactor knows the wallpaper is a video,
+        // and a change of wallpaper to one comes after. updateVideoDepthSurface is where the
+        // interactor finds out, so the panel is asked again from there.
+        try {
+            Method showDepth = Xp.findClass(CLS_KG_PANEL, cl).getMethod("updateShowDepthState");
+            Field videoEnable = interactorCls.getDeclaredField("depthVideoEnable");
+            videoEnable.setAccessible(true);
+            Field enableInner = interactorCls.getDeclaredField("depthEffectEnableInner");
+            enableInner.setAccessible(true);
+            Xp.hookAll(interactorCls, "updateVideoDepthSurface", chain -> {
+                Object result = chain.proceed();
+                Object interactor = chain.getThisObject();
+                Object panel = sKgPanel;
+                if (panel != null && videoEnable.getBoolean(interactor)
+                        && enableInner.getBoolean(interactor)) {
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                        try {
+                            showDepth.invoke(panel);
+                        } catch (Throwable t) {
+                            Xp.log(TAG + "depth video hand-back failed: " + t);
+                        }
+                    });
+                }
+                return result;
+            });
+            ok("depth-video-handback");
+        } catch (Throwable t) {
+            failed("depth-video-handback", t);
+        }
     }
+
+    /** The keyguard panel controller, as its updateShowDepthState last saw it. */
+    private static volatile Object sKgPanel;
 
     /** The StateFlow the interactor keeps the avoidance in; set back to "nothing to avoid". */
     private static void clearAvoidState(Object interactor) {
