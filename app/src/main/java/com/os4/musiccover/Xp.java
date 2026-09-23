@@ -49,13 +49,46 @@ final class Xp {
      * way the old XposedBridge.log was, so `logcat | grep MCProbe` still works.
      */
     static void log(String msg) {
-        Log.w("MCProbe", msg);
+        remember(msg);
         XposedInterface api = sApi;
         if (api != null) {
             api.log(Log.INFO, "LSPosed-Bridge", msg);
         } else {
             Log.i("LSPosed-Bridge", msg);
         }
+    }
+
+    /**
+     * The last lines this process logged, kept in memory.
+     *
+     * On the test phone logd keeps nothing below error level, so the framework log above reaches
+     * nobody - see the note on the probe ops that answer with setResultData. This is what `op tail`
+     * reads back instead, in whichever process was asked: SystemUI through PROBE, the wallpaper
+     * process through WPROBE. Bounded, and cheap enough to leave on.
+     */
+    private static final int TAIL_LINES = 160;
+    private static final java.util.ArrayDeque<String> sTail = new java.util.ArrayDeque<>();
+
+    private static void remember(String msg) {
+        String line = android.os.SystemClock.uptimeMillis() + " " + msg;
+        synchronized (sTail) {
+            if (sTail.size() >= TAIL_LINES) sTail.pollFirst();
+            sTail.addLast(line);
+        }
+    }
+
+    /** The remembered lines containing `grep` (all of them for null), oldest first, at most `max`. */
+    static String tail(String grep, int max) {
+        java.util.ArrayList<String> hits = new java.util.ArrayList<>();
+        synchronized (sTail) {
+            for (String line : sTail) {
+                if (grep == null || line.contains(grep)) hits.add(line);
+            }
+        }
+        int from = Math.max(0, hits.size() - Math.max(1, max));
+        StringBuilder out = new StringBuilder();
+        for (int i = from; i < hits.size(); i++) out.append(hits.get(i)).append('\n');
+        return out.toString();
     }
 
     // ---------------------------------------------------------------- lookup
@@ -212,16 +245,6 @@ final class Xp {
         } catch (ReflectiveOperationException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new IllegalStateException(obj.getClass().getName() + "." + name + " threw", cause);
-        }
-    }
-
-    static Object callStaticMethod(Class<?> cls, String name, Object... args) {
-        Method m = findMethod(cls, name, args);
-        try {
-            return m.invoke(null, args);
-        } catch (ReflectiveOperationException e) {
-            Throwable cause = e.getCause() != null ? e.getCause() : e;
-            throw new IllegalStateException(cls.getName() + "." + name + " threw", cause);
         }
     }
 

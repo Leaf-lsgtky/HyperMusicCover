@@ -422,13 +422,18 @@ public class FastMp4Muxer {
                 fos.write(newMoovPayload);
             }
 
-            if (destFile.exists()) {
-                destFile.delete();
-            }
+            // rename(2) replaces the target in one step, so the previous cover video stays
+            // whole until the new one is complete - and a player that still has the old file
+            // open keeps reading the old inode. Deleting first opened a window with no file.
             boolean renamed = tempDest.renameTo(destFile);
+            if (!renamed) {
+                tempDest.delete();
+                Xp.log(TAG + "injectGpmdTrack: could not move the new file into place");
+                return false;
+            }
             Xp.log(TAG + "injectGpmdTrack succeeded: " + destFile.getAbsolutePath()
                     + " (" + destFile.length() + "B, delta=" + sizeDelta + ")");
-            return renamed;
+            return true;
 
         } catch (Throwable t) {
             Xp.log(TAG + "injectGpmdTrack failed: " + t);

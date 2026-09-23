@@ -448,6 +448,7 @@ final class CoverPush {
         sCoverGuard = new ViewTreeObserver.OnPreDrawListener() {
             @Override
             public boolean onPreDraw() {
+                counterAodShrink(cover);
                 if (sCoverFadingOut == cover) {
                     // On the way out. Cover mode is already off, so the rule below would hide
                     // this view on this very frame - and it is the only thing still over the
@@ -500,6 +501,46 @@ final class CoverPush {
         cover.getViewTreeObserver().addOnPreDrawListener(sCoverGuard);
         sCoverGuarded = cover;
         Xp.log(Main.TAG + "video cover guard installed");
+    }
+
+    /**
+     * The scale the full-screen AOD's doDeductedImageScaleAnim last put on the keyguard's root
+     * layout (wallpaperScale - 0.05), recorded by its hook in Main. NaN until it has run.
+     */
+    static volatile float sAodShrink = Float.NaN;
+
+    /**
+     * Keeps the video cover full-screen while the keyguard's root layout is shrunk for the
+     * full-screen AOD. The layout carries the clock, the cards and the cover alike, and only the
+     * cover must not move: the video wallpaper's window behind it stays at full size, so a
+     * shrunk cover shows that window in all four corners. Undone with the inverse scale, around
+     * the layout's own pivot expressed in the cover's coordinates. Only that one scale is
+     * undone - an ancestor scaled by anything else (the unlock, the shade) is left to carry the
+     * cover along as it always has.
+     */
+    private static void counterAodShrink(View cover) {
+        float shrink = sAodShrink;
+        View scaled = null;
+        float offX = cover.getLeft(), offY = cover.getTop();
+        for (android.view.ViewParent p = cover.getParent(); p instanceof View; p = p.getParent()) {
+            View v = (View) p;
+            if (v.getScaleX() != 1f || v.getScaleY() != 1f) {
+                scaled = v;
+                break;
+            }
+            offX += v.getLeft();
+            offY += v.getTop();
+        }
+        float want = 1f;
+        if (scaled != null && shrink > 0f && shrink < 1f && scaled.getScaleX() == shrink) {
+            want = 1f / shrink;
+            cover.setPivotX(scaled.getPivotX() - offX);
+            cover.setPivotY(scaled.getPivotY() - offY);
+        }
+        if (cover.getScaleX() != want) {
+            cover.setScaleX(want);
+            cover.setScaleY(want);
+        }
     }
 
     /**

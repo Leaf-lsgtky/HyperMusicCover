@@ -155,21 +155,18 @@ final class LockLyrics {
     }
 
     static boolean blurSettled() {
-        if (!blurWanted()) return true;
+        // Only the video wallpaper's window has a reload to wait out. A still wallpaper frosts
+        // its own texture in the same fade as the cover, and holding the band back there only
+        // made it blink out for 280ms on every track change.
+        if (!Main.sVideoWallpaper || !blurWanted()) return true;
         long now = SystemClock.uptimeMillis();
         long blurElapsed = now - sBlurStartedAt;
         if (sBlurStartedAt > 0L && blurElapsed >= 0 && blurElapsed < BLUR_ENTER_DELAY_MS) {
-            if (Main.isVideoWallpaper()) {
-                if (sBlurVideoReloaded && blurElapsed >= BLUR_ENTER_MIN_MS) return true;
-            }
-            return false;
+            return sBlurVideoReloaded && blurElapsed >= BLUR_ENTER_MIN_MS;
         }
         long trackElapsed = now - sTrackChangedAt;
         if (sTrackChangedAt > 0L && trackElapsed >= 0 && trackElapsed < BLUR_ENTER_DELAY_MS) {
-            if (Main.isVideoWallpaper()) {
-                if (sBlurVideoReloaded && trackElapsed >= BLUR_ENTER_MIN_MS) return true;
-            }
-            return false;
+            return sBlurVideoReloaded && trackElapsed >= BLUR_ENTER_MIN_MS;
         }
         return true;
     }

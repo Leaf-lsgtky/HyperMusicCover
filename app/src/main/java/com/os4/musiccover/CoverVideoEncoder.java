@@ -275,10 +275,9 @@ public class CoverVideoEncoder {
             rawFile.delete();
 
             if (!injected || !destFile.exists() || destFile.length() == 0) {
+                // destFile is still the previous cover video - the muxer only replaces it once
+                // the new one is complete - and it may be what the player is showing. Left alone.
                 Xp.log(TAG + "encodeBitmapToMp4: FastMp4Muxer dual track injection failed");
-                if (destFile.exists()) {
-                    destFile.delete();
-                }
                 return false;
             }
 
