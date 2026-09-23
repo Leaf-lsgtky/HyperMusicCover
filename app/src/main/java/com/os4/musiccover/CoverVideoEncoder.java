@@ -47,7 +47,7 @@ public class CoverVideoEncoder {
      * @return true if successful, false otherwise
      */
     public static synchronized boolean encodeBitmapToMp4(Bitmap bitmap, File destFile) {
-        return encodeToMp4(null, bitmap, destFile, 0, 0);
+        return encodeToMp4(null, bitmap, destFile, 0, 0, false);
     }
 
     /**
@@ -59,7 +59,7 @@ public class CoverVideoEncoder {
      * @return true if successful, false otherwise
      */
     public static synchronized boolean encodeBitmapToMp4(Bitmap bitmap, File destFile, long contentKey) {
-        return encodeToMp4(null, bitmap, destFile, contentKey, 0);
+        return encodeToMp4(null, bitmap, destFile, contentKey, 0, false);
     }
 
     /**
@@ -78,24 +78,32 @@ public class CoverVideoEncoder {
      * @param from the picture to walk in from, or null for a one-frame cover
      * @param to the album cover
      * @param fadeMs how long the walk takes; ignored when `from` is null
+     * @param depthTrack whether the file is for the DEPTH shape, which plays an alpha video: it
+     *                   then carries the empty depth mask track that shape's player decodes
+     *                   alongside every frame (see FastMp4Muxer.emptyMask). Without it that player
+     *                   opens the file and draws nothing, leaving the last frame of the user's
+     *                   video on every surface.
      */
     public static synchronized boolean encodeToMp4(Bitmap from, Bitmap to, File destFile,
-                                                   long contentKey, long fadeMs) {
+                                                   long contentKey, long fadeMs,
+                                                   boolean depthTrack) {
         if (to == null || to.isRecycled()) {
             Xp.log(TAG + "encodeToMp4: bitmap is null or recycled");
             return false;
         }
         if (from != null && (from.isRecycled() || from == to)) from = null;
-        boolean ok = encodeOnce(from, to, destFile, contentKey, fadeMs);
+        // A depth file is a different file from the same cover without the track.
+        if (depthTrack && contentKey != 0) contentKey = ~contentKey;
+        boolean ok = encodeOnce(from, to, destFile, contentKey, fadeMs, depthTrack);
         if (!ok && from != null) {
             Xp.log(TAG + "the cover's crossfade did not encode - falling back to a one-frame cover");
-            ok = encodeOnce(null, to, destFile, contentKey, 0);
+            ok = encodeOnce(null, to, destFile, contentKey, 0, depthTrack);
         }
         return ok;
     }
 
     private static boolean encodeOnce(Bitmap from, Bitmap to, File destFile,
-                                      long contentKey, long fadeMs) {
+                                      long contentKey, long fadeMs, boolean depthTrack) {
         Bitmap bitmap = to;
         if (contentKey == 0) {
             contentKey = computeBitmapChecksum(bitmap);
@@ -261,7 +269,7 @@ public class CoverVideoEncoder {
                 return false;
             }
 
-            // Close muxer before injecting dual track
+            // Close the muxer before the file is moved or given its depth track
             try {
                 muxer.stop();
             } catch (Throwable ignored) {}
@@ -270,14 +278,22 @@ public class CoverVideoEncoder {
             } catch (Throwable ignored) {}
             muxer = null;
 
-            // Inject GoPro MET (gpmd) null-depth mask as Track 0
-            boolean injected = FastMp4Muxer.injectGpmdTrack(rawFile, destFile);
-            rawFile.delete();
+            // The plain shape plays the single track as it is. The depth shape needs the empty
+            // depth mask beside every frame, sized to the picture actually encoded - both cases
+            // replace destFile in one rename, so the cover video on screen stays whole.
+            boolean placed;
+            if (depthTrack) {
+                placed = FastMp4Muxer.injectGpmdTrack(rawFile, destFile, width, height);
+                rawFile.delete();
+            } else {
+                placed = rawFile.renameTo(destFile);
+                if (!placed) rawFile.delete();
+            }
 
-            if (!injected || !destFile.exists() || destFile.length() == 0) {
-                // destFile is still the previous cover video - the muxer only replaces it once
-                // the new one is complete - and it may be what the player is showing. Left alone.
-                Xp.log(TAG + "encodeBitmapToMp4: FastMp4Muxer dual track injection failed");
+            if (!placed || !destFile.exists() || destFile.length() == 0) {
+                // destFile is still the previous cover video, and it may be what the player is
+                // showing. Left alone.
+                Xp.log(TAG + "encodeBitmapToMp4: could not put the new cover video in place");
                 return false;
             }
 
@@ -285,7 +301,7 @@ public class CoverVideoEncoder {
             sLastContentKey = contentKey;
             sCachedVideoPath = destFile.getAbsolutePath();
             long cost = SystemClock.uptimeMillis() - startTime;
-            Xp.log(TAG + "Dual-track cover MP4 generated successfully at " + destFile.getAbsolutePath()
+            Xp.log(TAG + "cover MP4" + (depthTrack ? " with its depth track" : "") + " written to " + destFile.getAbsolutePath()
                     + " (" + width + "x" + height + ", " + (fadeFrames + 1) + " frames"
                     + (yuvFrom == null ? ", no fade" : ", fading in over " + (fadeFrames - 1)
                     + " frames") + ", " + destFile.length() + "B, " + cost + "ms)");

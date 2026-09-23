@@ -23,10 +23,37 @@ public class FastMp4Muxer {
 
     private static final String TAG = "[MCDualMux] ";
 
-    // 5-byte FastPlayer "empty/null mask" indicator (transparent foreground)
-    private static final byte[] GPMD_NULL_MASK = new byte[] {
-            (byte) 0x80, (byte) 0xb1, 0x71, (byte) 0x80, 0x00
-    };
+    /**
+     * An all-zero depth mask - no subject, so nothing is drawn in front of the clock - for a
+     * picture of `pixels` pixels, in the run-length code libfastplayer's
+     * AiProcesser::compressDecode2 reads.
+     *
+     * The code, read off a real MIUI depth video (1080x2400, 180 samples, every one of them
+     * decoding to exactly 2592000 pixels of 0 or 255): a 0x80 byte starts a run and is followed
+     * by its length and then its value; the length is one byte below 0x40, two bytes with 0x40
+     * set (14 bits), three bytes with 0x80 set (22 bits). Every other byte is one literal pixel.
+     * The OEM's own frames with no subject are exactly `80 a7 8d 00 00` - one run of 2592000
+     * zeros.
+     *
+     * The length has to be the PICTURE's. The decoder allocates the mask for the video track's
+     * size and writes the whole run into it, so the fixed `80 b1 71 80 00` this used to carry -
+     * 3240320 pixels, some other phone's video - overflowed a 1200x2608 (3129600) buffer and
+     * crashed the wallpaper process on every reload (SIGSEGV in compressDecode2, OS4.0.0.40).
+     */
+    static byte[] emptyMask(long pixels) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        long left = pixels;
+        while (left > 0) {
+            int run = (int) Math.min(left, 0x3FFFFFL);
+            out.write(0x80);
+            out.write(0x80 | (run >>> 16));
+            out.write((run >>> 8) & 0xFF);
+            out.write(run & 0xFF);
+            out.write(0x00);
+            left -= run;
+        }
+        return out.toByteArray();
+    }
 
     // Base64 template of Track 0 (gpmd track) from Xiaomi's depth video (490 bytes)
     private static final String TRAK0_BASE64 =
@@ -98,7 +125,7 @@ public class FastMp4Muxer {
      *
      * @return the rebuilt trak, or null if the template is not the shape this expects
      */
-    private static byte[] rebuildGpmdTrak(byte[] trak0, int[] absOffsets) {
+    private static byte[] rebuildGpmdTrak(byte[] trak0, int[] absOffsets, int maskLength) {
         Box mdia = findBox(parseBoxes(trak0, 8, trak0.length), "mdia");
         if (mdia == null) return null;
         Box minf = findBox(parseBoxes(trak0, mdia.offset + 8, mdia.offset + mdia.size), "minf");
@@ -124,7 +151,7 @@ public class FastMp4Muxer {
         byte[] newStsz = new byte[20];
         ByteBuffer.wrap(newStsz).order(ByteOrder.BIG_ENDIAN)
                 .putInt(20).put("stsz".getBytes(StandardCharsets.ISO_8859_1))
-                .putInt(0).putInt(GPMD_NULL_MASK.length).putInt(n);
+                .putInt(0).putInt(maskLength).putInt(n);
 
         byte[] newStco = new byte[16 + 4 * n];
         ByteBuffer stcoBuf = ByteBuffer.wrap(newStco).order(ByteOrder.BIG_ENDIAN);
@@ -163,7 +190,9 @@ public class FastMp4Muxer {
      * @param destFile        The target dual-track MP4 file for FastPlayer
      * @return true if successful, false otherwise
      */
-    public static boolean injectGpmdTrack(File singleTrackFile, File destFile) {
+    public static boolean injectGpmdTrack(File singleTrackFile, File destFile,
+                                          int width, int height) {
+        final byte[] mask = emptyMask((long) width * height);
         if (singleTrackFile == null || !singleTrackFile.exists() || singleTrackFile.length() < 64) {
             Xp.log(TAG + "singleTrackFile invalid: " + singleTrackFile);
             return false;
@@ -319,7 +348,7 @@ public class FastMp4Muxer {
             int[] absVideoOffsets = new int[sampleCount];
             for (int i = 0; i < sampleCount; i++) {
                 absGpmdOffsets[i] = absMdatStart + newMdatStream.size() + 8;
-                newMdatStream.write(GPMD_NULL_MASK);
+                newMdatStream.write(mask);
                 absVideoOffsets[i] = absMdatStart + newMdatStream.size() + 8;
                 newMdatStream.write(single, (int) srcOffsets[i], sampleSizes[i]);
             }
@@ -334,7 +363,7 @@ public class FastMp4Muxer {
             //    OEM's template that depends on the length of the picture, so they are the only
             //    part that is rewritten - see rebuildGpmdTrak().
             byte[] trak0 = Base64.getDecoder().decode(TRAK0_BASE64);
-            byte[] newTrak0 = rebuildGpmdTrak(trak0, absGpmdOffsets);
+            byte[] newTrak0 = rebuildGpmdTrak(trak0, absGpmdOffsets, mask.length);
             if (newTrak0 == null) {
                 Xp.log(TAG + "cannot rebuild the gpmd track for " + sampleCount + " samples");
                 return false;

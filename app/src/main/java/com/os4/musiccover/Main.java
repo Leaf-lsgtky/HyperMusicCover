@@ -1950,6 +1950,19 @@ public class Main extends XposedModule {
                         setResultData(cardHistory());
                     } else if ("depth".equals(op)) {
                         setDepthHidden(!i.getBooleanExtra("on", true));
+                    } else if ("vcprobe".equals(op)) {
+                        // What each layer of a live cover is showing right now, as average colours:
+                        // MIUI's two video TextureViews (whatever the player last put in them,
+                        // hidden or not) and our own cover view.
+                        setResultData("bg=" + avgColour(sVideoBg) + " fg=" + avgColour(sVideoFg)
+                                + " cover=" + avgColour(sCover) + " uncover=" + sUncoverProbe);
+                    } else if ("uncover".equals(op)) {
+                        // Hides our cover view only, leaving MIUI's layers as they are, so a
+                        // screenshot shows what is under it. See CoverPush.guardVideoCover.
+                        sUncoverProbe = i.getBooleanExtra("on", !sUncoverProbe);
+                        View cv = sCover;
+                        if (cv != null) cv.invalidate();
+                        setResultData("uncover=" + sUncoverProbe);
                     } else if ("pushart".equals(op)) {
                         boolean on = i.getBooleanExtra("on", true);
                         if (i.hasExtra("bias")) sBias = clamp01(i.getFloatExtra("bias", sBias));
@@ -5500,6 +5513,41 @@ public class Main extends XposedModule {
 
     /** A hand-back of the live wallpaper's surfaces that is waiting for a lock screen. */
     static volatile boolean sVideoWpOwed;
+
+    /** PROBE `uncover`: our video cover view hidden, so a screenshot shows what is under it. */
+    static volatile boolean sUncoverProbe;
+
+    /** A view's current picture as an average colour, for the vcprobe op. */
+    private static String avgColour(View v) {
+        if (v == null) return "absent";
+        try {
+            Bitmap b;
+            if (v instanceof android.view.TextureView) {
+                b = ((android.view.TextureView) v).getBitmap(60, 130);
+            } else {
+                if (v.getWidth() <= 0 || v.getHeight() <= 0) return "unlaid";
+                b = Bitmap.createBitmap(60, 130, Bitmap.Config.ARGB_8888);
+                android.graphics.Canvas cv = new android.graphics.Canvas(b);
+                cv.scale(60f / v.getWidth(), 130f / v.getHeight());
+                v.draw(cv);
+            }
+            if (b == null) return "no bitmap";
+            long r = 0, g = 0, bl = 0;
+            int n = b.getWidth() * b.getHeight();
+            int[] px = new int[n];
+            b.getPixels(px, 0, b.getWidth(), 0, 0, b.getWidth(), b.getHeight());
+            for (int p : px) {
+                r += (p >> 16) & 255;
+                g += (p >> 8) & 255;
+                bl += p & 255;
+            }
+            b.recycle();
+            return String.format(java.util.Locale.ROOT, "#%02x%02x%02x(%s)",
+                    r / n, g / n, bl / n, v.getVisibility() == View.VISIBLE ? "shown" : "hidden");
+        } catch (Throwable t) {
+            return "failed: " + t;
+        }
+    }
 
     /** The AOD wallpaper-dim value the system last set, and the root it was set on. */
     private static volatile float sLastWallpaperBlack = -1f;

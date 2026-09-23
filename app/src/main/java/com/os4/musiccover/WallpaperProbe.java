@@ -1770,6 +1770,7 @@ public class WallpaperProbe {
         if (sRegistered) return;
         sRegistered = true;
         sCtx = ctx.getApplicationContext();
+        checkTakeoverCrash(ctx);
         loadArt(ctx);
         // Restored from disk or not: either way the cover that belongs on screen is the one
         // SystemUI holds, and SystemUI has no way to learn ours is missing.
@@ -2784,6 +2785,21 @@ public class WallpaperProbe {
     /** The live lock wallpaper's engine: KeyguardVideoEngineImpl or KeyguardVideoDepthEngineImpl. */
     private static volatile Object sVideoEngine;
     /**
+     * The desktop's video engine. It owns the only wallpaper window when the lock screen and the
+     * desktop are set to the same video: MIUI then builds no lock engine at all, and the lock
+     * screen's glass and cards sample the desktop's window. See targetEngine().
+     */
+    private static volatile Object sDesktopVideoEngine;
+    /** The engine our cover video is on right now; null when it is on none. */
+    private static volatile Object sActiveEngine;
+    /**
+     * Shared video only: the cover was taken off the desktop's window for the desktop, and is
+     * owed back to it the next time the lock screen shows.
+     */
+    private static volatile boolean sSharedSuspended;
+    /** Whether the lock screen is up, as the engines are told by show/hideKeyguardWallpaper. */
+    private static volatile boolean sKeyguardUp = true;
+    /**
      * The two base classes. A subclass constructor runs its super's, so hooking these catches
      * every video engine; the instance's class name is what tells lock from desktop.
      */
@@ -2798,6 +2814,11 @@ public class WallpaperProbe {
     private static final String[] CLS_VIDEO_ENGINE_LOCK = {
             "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardVideoDepthEngineImpl",
             "com.miui.miwallpaper.wallpaperservice.impl.keyguard.KeyguardVideoEngineImpl",
+    };
+    /** Their desktop siblings, for the shared-video case only. */
+    private static final String[] CLS_VIDEO_ENGINE_DESKTOP = {
+            "com.miui.miwallpaper.wallpaperservice.impl.desktop.DesktopVideoDepthEngineImpl",
+            "com.miui.miwallpaper.wallpaperservice.impl.desktop.DesktopVideoEngineImpl",
     };
     private static final String CLS_FASTPLAYER = "com.miui.fastplayer.FastPlayer";
     private static final String CLS_VIDEO_PLAYER = "com.miui.miwallpaper.container.video.VideoPlayer";
@@ -2829,6 +2850,9 @@ public class WallpaperProbe {
      * takes its first frame from.
      */
     private static volatile String sLockVideoPath;
+    /** Each engine's own video path, as its getter last answered with the cover off. */
+    private static final java.util.Map<Object, String> sOwnPaths =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
     /** What the engine last asked its player's loop to be, before any forcing; null unknown. */
     private static volatile Boolean sLockLoops;
     /** Where the user's video was when the cover took the window, and when that was. */
@@ -2912,6 +2936,10 @@ public class WallpaperProbe {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    private static boolean isDesktopEngine(Object eng) {
+        return eng != null && eng.getClass().getName().contains("Desktop");
     }
 
     private static boolean isDepthEngine(Object eng) {
@@ -3037,27 +3065,88 @@ public class WallpaperProbe {
 
     // ------------------------------------------------------------------ hooks
 
+    /**
+     * The EngineService calls every video engine receives in the course of being attached and
+     * used - the lock screen showing, hiding, being swiped, a wallpaper update. Their names are
+     * the interface's and survive R8.
+     */
+    private static final java.util.Set<String> ENGINE_LIFECYCLE = new java.util.HashSet<>(
+            java.util.Arrays.asList("onWallpaperUpdate", "showKeyguardWallpaper",
+                    "hideKeyguardWallpaper", "updateKeyguardWallpaperRatio",
+                    "updateVideoWallpaperFrame", "controlVideoDepth", "setLockscreenVideoSurface"));
+
     private static void hookVideoEngines() {
-        for (String cn : CLS_VIDEO_ENGINE_BASES) {
+        // Captured from what the engine is CALLED with, not from its constructor. The
+        // constructor hook never fired on MiWallpaper 7.0.7: the app is compiled ahead of time
+        // and ART inlines a constructor that small into its caller, so a hook on it is never
+        // reached - measured, a video lock wallpaper set with the module loaded and no
+        // "captured" line at all. The attach path (the one method taking the UniversalEngine,
+        // and the ones taking the SurfaceHolder) and the lifecycle calls are large, interface
+        // dispatched and not inlined; any of them names the engine the moment it is in use.
+        java.util.List<String> classes = new java.util.ArrayList<>();
+        java.util.Collections.addAll(classes, CLS_VIDEO_ENGINE_BASES);
+        java.util.Collections.addAll(classes, CLS_VIDEO_ENGINE_LOCK);
+        java.util.Collections.addAll(classes, CLS_VIDEO_ENGINE_DESKTOP);
+        for (String cn : classes) {
             try {
                 Class<?> vd = Xp.findClass(cn, sCl);
+                int n = 0;
+                for (Method m : vd.getDeclaredMethods()) {
+                    int mod = m.getModifiers();
+                    if (Modifier.isAbstract(mod) || Modifier.isStatic(mod) || Modifier.isNative(mod)) {
+                        continue;
+                    }
+                    Class<?>[] ps = m.getParameterTypes();
+                    boolean attach = ps.length == 1
+                            && (ps[0] == android.view.SurfaceHolder.class
+                            || ps[0].getName().endsWith("UniversalWallpaper$UniversalEngine"));
+                    if (!attach && !ENGINE_LIFECYCLE.contains(m.getName())) continue;
+                    final boolean keyguardCall = m.getParameterCount() == 2
+                            && (m.getName().equals("showKeyguardWallpaper")
+                            || m.getName().equals("hideKeyguardWallpaper"));
+                    final boolean showing = m.getName().equals("showKeyguardWallpaper");
+                    Xp.hook(m, chain -> {
+                        Object self = chain.getThisObject();
+                        noteVideoEngine(self);
+                        // Every engine is told when the lock screen shows and hides - the
+                        // controller dispatches it to all of them - so this also fires once per
+                        // engine; onKeyguardSeen() acts on the change only.
+                        if (keyguardCall) onKeyguardSeen(showing);
+                        return chain.proceed();
+                    });
+                    n++;
+                }
                 Xp.hookAllConstructors(vd, chain -> {
                     Object result = chain.proceed();
-                    Object self = chain.getThisObject();
-                    // The desktop has video engines too, and its wallpaper is not ours to touch.
-                    if (self.getClass().getName().contains("Keyguard")) {
-                        sVideoEngine = self;
-                        sVideoDepth = null;
-                        Xp.log(TAG + "video engine captured: " + self.getClass().getName());
-                    }
+                    noteVideoEngine(chain.getThisObject());
                     return result;
                 });
-                Xp.log(TAG + "video engine hooked on " + cn.substring(cn.lastIndexOf('.') + 1));
+                Xp.log(TAG + "video engine hooked on " + cn.substring(cn.lastIndexOf('.') + 1)
+                        + " (" + n + " calls)");
             } catch (Throwable t) {
                 Xp.log(TAG + "video engine hook failed on " + cn + ": " + t);
             }
         }
-        for (String cn : CLS_VIDEO_ENGINE_LOCK) {
+        // And from the framework's side: every wallpaper Engine is told its visibility by
+        // WallpaperService over binder, which nothing can inline, and the UniversalEngine holds
+        // the EngineService it delegates to in a field of that type.
+        try {
+            Class<?> ue = Xp.findClass(
+                    "com.miui.miwallpaper.wallpaperservice.UniversalWallpaper$UniversalEngine", sCl);
+            Xp.hookAll(ue, "onVisibilityChanged", chain -> {
+                Object r = chain.proceed();
+                noteVideoEngine(fieldOfType(chain.getThisObject(),
+                        "com.miui.miwallpaper.wallpaperservice.service.EngineService"));
+                return r;
+            });
+            Xp.log(TAG + "UniversalEngine.onVisibilityChanged hooked");
+        } catch (Throwable t) {
+            Xp.log(TAG + "UniversalEngine.onVisibilityChanged hook failed: " + t);
+        }
+        java.util.List<String> getters = new java.util.ArrayList<>();
+        java.util.Collections.addAll(getters, CLS_VIDEO_ENGINE_LOCK);
+        java.util.Collections.addAll(getters, CLS_VIDEO_ENGINE_DESKTOP);
+        for (String cn : getters) {
             try {
                 hookVideoPathGetter(Xp.findClass(cn, sCl));
             } catch (Throwable t) {
@@ -3066,6 +3155,137 @@ public class WallpaperProbe {
         }
         hookPlayerDataSource();
         hookPlayerLoop();
+    }
+
+    /**
+     * A video engine has been seen in use: a Keyguard one is the lock wallpaper's, a Desktop one
+     * the desktop's. Whichever of them turns out to be the one the lock screen shows (see
+     * targetEngine()) gets a waiting cover straight away - this process restarted, or the
+     * wallpaper was changed, with the cover up - rather than at the next track.
+     */
+    private static void noteVideoEngine(Object self) {
+        if (self == null || self == sVideoEngine || self == sDesktopVideoEngine) return;
+        String n = self.getClass().getName();
+        if (n.contains("Keyguard")) {
+            sVideoEngine = self;
+        } else if (n.contains("Desktop")) {
+            sDesktopVideoEngine = self;
+        } else {
+            return;
+        }
+        Xp.log(TAG + "video engine captured: " + n);
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (sActiveEngine == null && targetEngine() == self && videoPath() && sArt != null) {
+                Xp.log(TAG + "a cover is waiting, putting it on " + self.getClass().getSimpleName());
+                videoWindowTakeover(false);
+            }
+        });
+    }
+
+    /**
+     * Which engine's window the lock screen shows: the lock engine's, unless the lock screen and
+     * the desktop are set to the same video, in which case MIUI builds no lock engine and it is
+     * the desktop's. Null when the one it would be has not been seen yet.
+     */
+    private static Object targetEngine() {
+        return sharedVideo() ? sDesktopVideoEngine : sVideoEngine;
+    }
+
+    /** The controller's path method, String (int which, boolean preview) - found by shape. */
+    private static volatile Method sPathOf;
+
+    private static String controllerPath(Object eng, int which) {
+        try {
+            Object ctrl = fieldOfType(eng, "com.miui.miwallpaper.manager.WallpaperServiceController");
+            if (ctrl == null) return null;
+            Method m = sPathOf;
+            if (m == null) {
+                for (Method c : ctrl.getClass().getDeclaredMethods()) {
+                    Class<?>[] ps = c.getParameterTypes();
+                    if (c.getReturnType() == String.class && ps.length == 2
+                            && ps[0] == int.class && ps[1] == boolean.class) {
+                        if (m != null) return null;
+                        m = c;
+                    }
+                }
+                if (m == null) return null;
+                m.setAccessible(true);
+                sPathOf = m;
+            }
+            return (String) m.invoke(ctrl, which, false);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static volatile String sSharedKey;
+    private static volatile boolean sSharedAnswer;
+
+    /**
+     * Whether the lock screen and the desktop play the same video. MIUI copies the video to a lock
+     * file and a home file, so it is the two files' CONTENT that is compared - length, and 64KB
+     * from each end - asked of the controller the engines themselves ask. Cached on the paths,
+     * lengths and times, so a changed wallpaper is noticed.
+     */
+    private static boolean sharedVideo() {
+        Object desk = sDesktopVideoEngine;
+        if (desk == null || !Boolean.TRUE.equals(sLockIsVideo)) return false;
+        String lock = controllerPath(desk, 2), home = controllerPath(desk, 1);
+        if (lock == null || home == null) return false;
+        File a = new File(lock), b = new File(home);
+        String key = lock + a.length() + a.lastModified() + home + b.length() + b.lastModified();
+        if (key.equals(sSharedKey)) return sSharedAnswer;
+        boolean same = a.isFile() && b.isFile() && a.length() == b.length()
+                && (lock.equals(home) || sameEnds(a, b));
+        sSharedKey = key;
+        sSharedAnswer = same;
+        Xp.log(TAG + "lock and desktop video are " + (same ? "the SAME" : "different")
+                + " (" + lock + ", " + home + ")");
+        return same;
+    }
+
+    private static boolean sameEnds(File a, File b) {
+        try (java.io.RandomAccessFile ra = new java.io.RandomAccessFile(a, "r");
+             java.io.RandomAccessFile rb = new java.io.RandomAccessFile(b, "r")) {
+            int n = (int) Math.min(65536L, ra.length());
+            byte[] x = new byte[n], y = new byte[n];
+            for (long at : new long[]{0L, Math.max(0L, ra.length() - n)}) {
+                ra.seek(at);
+                rb.seek(at);
+                ra.readFully(x);
+                rb.readFully(y);
+                if (!java.util.Arrays.equals(x, y)) return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * The lock screen showed or hid. Only the shared-video case acts on it: there the cover sits
+     * in the DESKTOP's window, so it is taken off as the lock screen goes - the desktop comes back
+     * playing its own video - and put back as the lock screen returns.
+     */
+    private static void onKeyguardSeen(boolean showing) {
+        if (sKeyguardUp == showing) return;
+        sKeyguardUp = showing;
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (!showing) {
+                Object active = sActiveEngine;
+                if (sCoverVideoActive && active != null && active == sDesktopVideoEngine) {
+                    Xp.log(TAG + "lock screen gone: the desktop gets its own video back");
+                    sSharedSuspended = true;
+                    giveBack(sTakeoverGen.incrementAndGet(), false);
+                }
+            } else if (sSharedSuspended) {
+                sSharedSuspended = false;
+                if (videoPath() && sArt != null && sActiveEngine == null) {
+                    Xp.log(TAG + "lock screen back: the cover goes back on the desktop's window");
+                    videoWindowTakeover(false);
+                }
+            }
+        });
     }
 
     /**
@@ -3087,16 +3307,16 @@ public class WallpaperProbe {
             }
             Xp.hook(m, chain -> {
                 Object self = chain.getThisObject();
-                if (self != null && self == sVideoEngine) {
-                    String cover = sCoverVideoPath;
-                    if (sCoverVideoActive && cover != null) return cover;
-                    Object r = chain.proceed();
-                    if (r instanceof String && !((String) r).isEmpty() && !r.equals(cover)) {
-                        sLockVideoPath = (String) r;
-                    }
-                    return r;
+                String cover = sCoverVideoPath;
+                if (self != null && self == sActiveEngine && sCoverVideoActive && cover != null) {
+                    return cover;
                 }
-                return chain.proceed();
+                Object r = chain.proceed();
+                if (self != null && r instanceof String && !((String) r).isEmpty()
+                        && !r.equals(cover)) {
+                    sOwnPaths.put(self, (String) r);
+                }
+                return r;
             });
             n++;
             Xp.log(TAG + "video path getter hooked: " + cls.getSimpleName() + "." + m.getName());
@@ -3136,7 +3356,7 @@ public class WallpaperProbe {
                     Object self = chain.getThisObject();
                     String cover = sCoverVideoPath;
                     if (!sCoverVideoActive || cover == null
-                            || self != lockVideoPlayer(sVideoEngine)) {
+                            || self != lockVideoPlayer(sActiveEngine)) {
                         return chain.proceed();
                     }
                     Object[] args = chain.getArgs().toArray();
@@ -3177,15 +3397,15 @@ public class WallpaperProbe {
 
     private static final XposedInterface.Hooker LOOP_HOOKER = chain -> {
         Object self = chain.getThisObject();
-        Object eng = sVideoEngine;
-        if (eng == null || self != lockPlayer(eng)) return chain.proceed();
         Object[] args = chain.getArgs().toArray();
         if (args.length == 0 || !(args[0] instanceof Boolean)) return chain.proceed();
-        if (sCoverVideoActive) {
+        Object active = sActiveEngine;
+        if (sCoverVideoActive && active != null && self == lockPlayer(active)) {
             args[0] = Boolean.FALSE;
             return chain.proceed(args);
         }
-        sLockLoops = (Boolean) args[0];
+        Object target = targetEngine();
+        if (target != null && self == lockPlayer(target)) sLockLoops = (Boolean) args[0];
         return chain.proceed();
     };
 
@@ -3271,15 +3491,10 @@ public class WallpaperProbe {
      */
     private static boolean videoWindowTakeover(boolean on) {
         final int gen = sTakeoverGen.incrementAndGet();
-        final Object eng = sVideoEngine;
-        if (eng == null) {
-            Xp.log(TAG + "videoWindowTakeover: no lock video engine captured");
-            tellSystemUi("videoreload", "no video engine to reload");
-            return false;
-        }
-
         if (on) {
             sFadeFrom = null;
+            // Cover mode is over, so nothing is owed to the desktop at the next lock either.
+            sSharedSuspended = false;
             if (!sCoverVideoActive) {
                 // Taken down before the cover ever reached the window (an encode still running,
                 // which the bumped generation now drops): the user's video never stopped, so the
@@ -3288,15 +3503,34 @@ public class WallpaperProbe {
                 tellSystemUi("videoreload", "no cover video was active");
                 return true;
             }
-            sCoverVideoActive = false;
-            sCoverVideoPath = null;
-            unpinVideoPath(eng);
-            Xp.log(TAG + "videoWindowTakeover: giving the window back to the wallpaper's video");
-            final long savedPos = sSavedVideoPosMs;
-            final long savedAt = sSavedVideoAtMs;
-            sSavedVideoPosMs = -1L;
-            reloadThen(eng, gen, fp -> restorePosition(eng, gen, savedPos, savedAt));
+            giveBack(gen, true);
             return true;
+        }
+
+        final Object eng = targetEngine();
+        if (eng == null) {
+            Xp.log(TAG + "videoWindowTakeover: no video engine for the lock screen yet");
+            tellSystemUi("videoreload", "no video engine to reload");
+            return false;
+        }
+        if (takeoverBroken(eng)) {
+            Xp.log(TAG + "videoWindowTakeover: " + eng.getClass().getSimpleName() + " crashed on a"
+                    + " cover video before, its window is left to its own video");
+            tellSystemUi("videoreload", "this engine crashed on a cover video before");
+            return false;
+        }
+        if (isDesktopEngine(eng) && !sKeyguardUp) {
+            // Shared video, and the desktop is what is on screen: the cover would be on the
+            // desktop. Owed to the next lock screen instead - see onKeyguardSeen().
+            sSharedSuspended = true;
+            Xp.log(TAG + "videoWindowTakeover: the desktop is showing, the cover waits for the lock");
+            tellSystemUi("videoreload", "the desktop is showing, the cover waits for the lock");
+            return true;
+        }
+        if (sCoverVideoActive && sActiveEngine != null && sActiveEngine != eng) {
+            // The lock screen moved to another engine under the cover (the wallpaper was
+            // changed between shared and separate): hand the old one its video first.
+            giveBack(gen, false);
         }
 
         final Bitmap art = sArt;
@@ -3311,6 +3545,7 @@ public class WallpaperProbe {
             // Where the user's video is, read before anything replaces it. The restore resumes
             // from here plus however long the cover was up.
             sSavedVideoPosMs = Math.max(0L, playerPositionMs(lockPlayer(eng)));
+            sLockVideoPath = sOwnPaths.get(eng);
             sSavedVideoAtMs = SystemClock.uptimeMillis();
             Xp.log(TAG + "videoWindowTakeover: the wallpaper's video was at "
                     + sSavedVideoPosMs + "ms");
@@ -3353,7 +3588,7 @@ public class WallpaperProbe {
                         ownFrom = from != null;
                     }
                     boolean ok = CoverVideoEncoder.encodeToMp4(from, to, videoFile, checksum,
-                            from == null ? 0L : fadeMs);
+                            from == null ? 0L : fadeMs, isDepthEngine(eng));
                     if (gen != sTakeoverGen.get()) {
                         // Taken down, or superseded by a newer track, while this encoded. The
                         // newer request has said - or will say - its own word to SystemUI.
@@ -3368,14 +3603,26 @@ public class WallpaperProbe {
                     final String path = videoFile.getAbsolutePath();
                     new Handler(Looper.getMainLooper()).post(() -> {
                         if (gen != sTakeoverGen.get()) return;
+                        if (isDesktopEngine(eng) && !sKeyguardUp) {
+                            // Unlocked while this encoded, on a shared video.
+                            sSharedSuspended = true;
+                            tellSystemUi("videoreload", "the desktop is showing, the cover waits");
+                            return;
+                        }
                         sCoverVideoPath = path;
                         sCoverVideoActive = true;
+                        sActiveEngine = eng;
                         pinVideoPath(eng);
+                        markTakeover(eng);
                         Xp.log(TAG + "videoWindowTakeover: cover video (" + (lyricBlur ? "frosted" : "sharp")
                                 + ", " + new File(path).length() + "B) into "
                                 + eng.getClass().getSimpleName());
-                        reloadThen(eng, gen, fp -> tellSystemUi("videoreload",
-                                "the cover is on the window"));
+                        reloadThen(eng, gen, fp -> {
+                            tellSystemUi("videoreload", "the cover is on the window");
+                            // Alive a few seconds past the first frame: this engine plays a cover.
+                            new Handler(Looper.getMainLooper()).postDelayed(
+                                    WallpaperProbe::clearTakeoverMark, TAKEOVER_SURVIVE_MS);
+                        });
                     });
                 } finally {
                     to.recycle();
@@ -3389,6 +3636,107 @@ public class WallpaperProbe {
             }
         });
         return true;
+    }
+
+    /**
+     * Takes the cover off the engine it is on and gives that engine's window back to its own
+     * video, resumed where it would have been. `tell` is whether SystemUI is waiting on this -
+     * it is when cover mode ends; it is not when a shared video's cover is only being taken off
+     * the desktop for the length of an unlock.
+     */
+    private static void giveBack(final int gen, final boolean tell) {
+        final Object eng = sActiveEngine;
+        sCoverVideoActive = false;
+        sCoverVideoPath = null;
+        sActiveEngine = null;
+        if (eng == null) {
+            if (tell) tellSystemUi("videoreload", "no cover video was active");
+            return;
+        }
+        unpinVideoPath(eng);
+        Xp.log(TAG + "giving " + eng.getClass().getSimpleName() + " its own video back");
+        final long savedPos = sSavedVideoPosMs;
+        final long savedAt = sSavedVideoAtMs;
+        final String path = sLockVideoPath;
+        sSavedVideoPosMs = -1L;
+        reloadThen(eng, gen, fp -> restorePosition(eng, gen, path, savedPos, savedAt, tell));
+    }
+
+    // ------------------------------------------------------------------ the crash guard
+
+    /**
+     * Written just before a reload that puts a cover video on an engine, removed once the process
+     * has lived TAKEOVER_SURVIVE_MS past its first frame. Found at the next start, it means the
+     * process died with a cover video in the player - and since this process restores its cover
+     * on start and puts it straight back, that is a crash loop: measured on OS4.0.0.40, where the
+     * depth engine's native decoder crashed on every reload, the process restarted every two
+     * seconds until the system stopped binding the wallpaper at all. The engine class is then
+     * recorded against this module build and never given a cover video again by it.
+     */
+    private static final String TAKEOVER_MARK = "mc_takeover_pending";
+    private static final String TAKEOVER_BROKEN = "mc_takeover_broken";
+    private static final long TAKEOVER_SURVIVE_MS = 3000L;
+    /** "engine class|module build" entries that crashed; see checkTakeoverCrash(). */
+    private static final java.util.Set<String> sBrokenTakeovers =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+    /** This module build, so a fixed build gets to try again. */
+    private static String moduleStamp() {
+        try {
+            android.content.pm.ApplicationInfo ai = Xp.api().getModuleApplicationInfo();
+            return String.valueOf(new File(ai.sourceDir).lastModified());
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    private static String takeoverKey(Object eng) {
+        return eng.getClass().getName() + "|" + moduleStamp();
+    }
+
+    private static void checkTakeoverCrash(Context ctx) {
+        try {
+            File broken = new File(ctx.getFilesDir(), TAKEOVER_BROKEN);
+            File mark = new File(ctx.getFilesDir(), TAKEOVER_MARK);
+            if (mark.exists()) {
+                String key = new String(readBytes(mark.getAbsolutePath()), "UTF-8").trim();
+                mark.delete();
+                java.io.FileOutputStream out = new java.io.FileOutputStream(broken, true);
+                out.write((key + "\n").getBytes("UTF-8"));
+                out.close();
+                Xp.log(TAG + "the last process died putting a cover video on " + key
+                        + " - that engine is not given one again by this build");
+            }
+            if (broken.exists()) {
+                for (String line : new String(readBytes(broken.getAbsolutePath()), "UTF-8").split("\n")) {
+                    if (!line.trim().isEmpty()) sBrokenTakeovers.add(line.trim());
+                }
+            }
+        } catch (Throwable t) {
+            Xp.log(TAG + "crash guard check failed: " + t);
+        }
+    }
+
+    private static boolean takeoverBroken(Object eng) {
+        return sBrokenTakeovers.contains(takeoverKey(eng));
+    }
+
+    private static void markTakeover(Object eng) {
+        Context c = sCtx;
+        if (c == null) return;
+        try {
+            java.io.FileOutputStream out =
+                    new java.io.FileOutputStream(new File(c.getFilesDir(), TAKEOVER_MARK));
+            out.write(takeoverKey(eng).getBytes("UTF-8"));
+            out.close();
+        } catch (Throwable t) {
+            Xp.log(TAG + "crash guard mark failed: " + t);
+        }
+    }
+
+    private static void clearTakeoverMark() {
+        Context c = sCtx;
+        if (c != null) new File(c.getFilesDir(), TAKEOVER_MARK).delete();
     }
 
     /** What to do with the rebuilt player once its first frame is on the window. */
@@ -3412,7 +3760,7 @@ public class WallpaperProbe {
             if (gen != sTakeoverGen.get()) return;
             final Object before = lockPlayer(eng);
             try {
-                Xp.callMethod(eng, "onWallpaperUpdate", "video", 2);
+                Xp.callMethod(eng, "onWallpaperUpdate", "video", isDesktopEngine(eng) ? 1 : 2);
             } catch (Throwable t) {
                 Xp.log(TAG + "reload failed: " + t);
                 tellSystemUi("videoreload", "the reload failed");
@@ -3464,9 +3812,10 @@ public class WallpaperProbe {
      * wraps; a play-once video that would have finished parks on its last frame instead of
      * replaying its ending.
      */
-    private static void restorePosition(final Object eng, final int gen,
-                                        final long savedPos, final long savedAt) {
-        long dur = videoDurationMs(sLockVideoPath);
+    private static void restorePosition(final Object eng, final int gen, final String path,
+                                        final long savedPos, final long savedAt,
+                                        final boolean tell) {
+        long dur = videoDurationMs(path);
         long target = savedPos < 0 ? 0L : savedPos + (SystemClock.uptimeMillis() - savedAt);
         boolean park = false;
         if (dur > 0) {
@@ -3481,7 +3830,7 @@ public class WallpaperProbe {
         Xp.log(TAG + "restore: saved " + savedPos + "ms, target " + target + "ms of " + dur
                 + "ms, loops=" + sLockLoops + (park ? ", parking on the last frame" : ""));
         if (target <= 100L && !park) {
-            tellSystemUi("videoreload", "the wallpaper's video is back");
+            if (tell) tellSystemUi("videoreload", "the wallpaper's video is back");
             return;
         }
         final long want = target;
@@ -3502,7 +3851,7 @@ public class WallpaperProbe {
                 }
                 if (parkIt) playerPause(now);
                 Xp.log(TAG + "restore: at " + at + "ms after " + (tries[0] + 1) + " seek(s)");
-                tellSystemUi("videoreload", "the wallpaper's video is back at " + at + "ms");
+                if (tell) tellSystemUi("videoreload", "the wallpaper's video is back at " + at + "ms");
             }, SEEK_VERIFY_MS);
         };
         h.post(step[0]);
@@ -3585,11 +3934,16 @@ public class WallpaperProbe {
 
     /** The video half of `WPROBE op state`, as the broadcast's result. */
     private static String describeVideo() {
-        Object eng = sVideoEngine;
+        Object eng = sActiveEngine != null ? sActiveEngine : targetEngine();
         Object fp = lockPlayer(eng);
         Object mgr = videoDepthManager(eng);
         StringBuilder sb = new StringBuilder();
         sb.append("engine=").append(eng == null ? "none" : eng.getClass().getSimpleName())
+          .append(" lockEngine=").append(sVideoEngine == null ? "none" : "seen")
+          .append(" desktopEngine=").append(sDesktopVideoEngine == null ? "none" : "seen")
+          .append(" shared=").append(sharedVideo())
+          .append(" keyguardUp=").append(sKeyguardUp)
+          .append(" suspended=").append(sSharedSuspended)
           .append(" lockIsVideo=").append(sLockIsVideo)
           .append(" coverActive=").append(sCoverVideoActive)
           .append(" coverPath=").append(sCoverVideoPath)
@@ -3599,6 +3953,7 @@ public class WallpaperProbe {
           .append(" player=").append(describePlayer(eng, fp))
           .append(" depthPath=").append(mgr == null ? "-" : readPathField(mgr))
           .append(" pinned=").append(sPathPinned)
+          .append(" broken=").append(sBrokenTakeovers)
           .append(" gen=").append(sTakeoverGen.get());
         return sb.toString();
     }

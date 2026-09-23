@@ -449,6 +449,13 @@ final class CoverPush {
             @Override
             public boolean onPreDraw() {
                 counterAodShrink(cover);
+                if (Main.sUncoverProbe) {
+                    // PROBE `uncover`: our view out of the way, MIUI's layers left hidden, so the
+                    // screen shows the wallpaper WINDOW - which is what this probe is for.
+                    if (cover.getVisibility() != View.INVISIBLE) cover.setVisibility(View.INVISIBLE);
+                    hideVideoSurfaces();
+                    return true;
+                }
                 if (sCoverFadingOut == cover) {
                     // On the way out. Cover mode is already off, so the rule below would hide
                     // this view on this very frame - and it is the only thing still over the
