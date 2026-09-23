@@ -2164,7 +2164,10 @@ public class WallpaperProbe {
         composer().post(new Runnable() {
             @Override
             public void run() {
-                Bitmap sharp = sharpFittedArt();
+                // Warming the still path's frosted copy. A live wallpaper's cover is frosted by
+                // the video worker instead, and this was 110-150ms on the composer - the thread
+                // the next cover's decode waits on - for a picture nothing reads.
+                Bitmap sharp = videoPath() ? null : sharpFittedArt();
                 if (on && sharp != null) frostedOf(sharp);
                 final long t0 = SystemClock.uptimeMillis();
                 final Handler h = new Handler(Looper.getMainLooper());
@@ -2181,13 +2184,17 @@ public class WallpaperProbe {
                             h.postDelayed(this, 30L);
                             return;
                         }
-                        Bitmap from = fittedArt();
+                        boolean video = videoPath();
+                        // On the video path `from` is only the crossfade's other end, and
+                        // without a crossfade it would be a frosting on the main thread for
+                        // nothing.
+                        Bitmap from = video && !sVideoFade ? null : fittedArt();
                         sLyricBlur = on;
-                        Bitmap to = fittedArt();
+                        Bitmap to = video ? null : fittedArt();
                         Xp.log(TAG + "lyric blur " + (on ? "on" : "off") + " (waited "
                                 + (SystemClock.uptimeMillis() - t0) + "ms)");
                         if (sArt == null) return;
-                        if (videoPath()) {
+                        if (video) {
                             sFadeFrom = from;
                             videoWindowTakeover(false);
                             return;
@@ -2264,7 +2271,10 @@ public class WallpaperProbe {
         sAsks = 0;
         sFitted = null;
         sFittedOf = null;
-        Bitmap to = fittedArt();   // scale here, not on the GL thread
+        // Scale here, not on the GL thread - on the still path. A live wallpaper's cover is built
+        // by the video worker from sArt, and this was a full-screen frosting on the main thread
+        // (110-140ms) in front of it on every entry under the lyrics, for a picture nothing read.
+        Bitmap to = videoPath() ? null : fittedArt();
         Xp.log(TAG + "art set " + describe(b));
         if (videoPath()) videoWindowTakeover(false);
         else if (fade && from != null && to != null) {
@@ -3590,6 +3600,16 @@ public class WallpaperProbe {
                 int w = sReportedW > 0 ? sReportedW : ctx.getResources().getDisplayMetrics().widthPixels;
                 int h = sReportedH > 0 ? sReportedH : ctx.getResources().getDisplayMetrics().heightPixels;
                 int ew = (w / 2) * 2, eh = (h / 2) * 2;
+                // A cover already encoded for this very art is only a reload. Asked before the
+                // crop and the frosting, which are what a cache hit used to spend 170ms on before
+                // the encoder said it had the file all along. Only a one-frame cover: a
+                // crossfade's file is keyed on its other end too, which needs the pictures.
+                boolean fadeWanted = sVideoFade;
+                if (!fadeWanted && CoverVideoEncoder.isCached(videoFile, checksum, isDepthEngine(eng))) {
+                    Xp.log(TAG + "videoWindowTakeover: " + videoFile.getName() + " is already this cover");
+                    putCoverVideo(eng, gen, videoFile.getAbsolutePath(), lyricBlur);
+                    return;
+                }
                 // centerCrop always allocates, so this end is ours to give back.
                 Bitmap to = centerCrop(art, ew, eh);
                 if (lyricBlur) {
@@ -3623,30 +3643,7 @@ public class WallpaperProbe {
                         tellSystemUi("videoreload", "the cover video could not be encoded");
                         return;
                     }
-                    final String path = videoFile.getAbsolutePath();
-                    new Handler(Looper.getMainLooper()).post(() -> {
-                        if (gen != sTakeoverGen.get()) return;
-                        if (isDesktopEngine(eng) && !lockScreenUp()) {
-                            // Unlocked while this encoded, on a shared video.
-                            sSharedSuspended = true;
-                            tellSystemUi("videoreload", "the desktop is showing, the cover waits");
-                            return;
-                        }
-                        sCoverVideoPath = path;
-                        sCoverVideoActive = true;
-                        sActiveEngine = eng;
-                        pinVideoPath(eng);
-                        markTakeover(eng);
-                        Xp.log(TAG + "videoWindowTakeover: cover video (" + (lyricBlur ? "frosted" : "sharp")
-                                + ", " + new File(path).length() + "B) into "
-                                + eng.getClass().getSimpleName());
-                        reloadThen(eng, gen, fp -> {
-                            tellSystemUi("videoreload", "the cover is on the window");
-                            // Alive a few seconds past the first frame: this engine plays a cover.
-                            new Handler(Looper.getMainLooper()).postDelayed(
-                                    WallpaperProbe::clearTakeoverMark, TAKEOVER_SURVIVE_MS);
-                        });
-                    });
+                    putCoverVideo(eng, gen, videoFile.getAbsolutePath(), lyricBlur);
                 } finally {
                     to.recycle();
                     if (ownFrom && from != null) from.recycle();
@@ -3659,6 +3656,36 @@ public class WallpaperProbe {
             }
         });
         return true;
+    }
+
+    /** The encoded cover goes into the engine's window. From the video worker. */
+    private static void putCoverVideo(final Object eng, final int gen, final String path,
+                                      final boolean lyricBlur) {
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (gen != sTakeoverGen.get()) return;
+            if (isDesktopEngine(eng) && !lockScreenUp()) {
+                // Unlocked while this encoded, on a shared video.
+                sSharedSuspended = true;
+                tellSystemUi("videoreload", "the desktop is showing, the cover waits");
+                return;
+            }
+            sCoverVideoPath = path;
+            sCoverVideoActive = true;
+            sActiveEngine = eng;
+            pinVideoPath(eng);
+            markTakeover(eng);
+            Xp.log(TAG + "videoWindowTakeover: cover video (" + (lyricBlur ? "frosted" : "sharp")
+                    + ", " + new File(path).length() + "B) into "
+                    + eng.getClass().getSimpleName());
+            // Ahead of the reload, not after it: see CoverPush.noteVideoReloading().
+            tellSystemUi("videoreloading", "the cover is going onto the window");
+            reloadThen(eng, gen, fp -> {
+                tellSystemUi("videoreload", "the cover is on the window");
+                // Alive a few seconds past the first frame: this engine plays a cover.
+                new Handler(Looper.getMainLooper()).postDelayed(
+                        WallpaperProbe::clearTakeoverMark, TAKEOVER_SURVIVE_MS);
+            });
+        });
     }
 
     /**

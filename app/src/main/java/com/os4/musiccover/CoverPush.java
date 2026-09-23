@@ -162,6 +162,19 @@ final class CoverPush {
                 return;
             }
         }
+        // The video path's view shows the frosted copy, and that is made from the source and the
+        // layout alone (CoverCompose.frostedFor) - nothing it needs waits on the composition. So it
+        // is made alongside it rather than after it and the JPEG, which put 60ms of encoding for
+        // the OTHER process in front of this one's own view on every entry.
+        java.util.concurrent.FutureTask<Bitmap> frostTask = null;
+        if (Main.sVideoWallpaper) {
+            final Bitmap srcArt = art;
+            final int fw = w, fh = h;
+            final float fb = Main.sCoverCardStyle.mode == CoverCardStyle.CARD ? 0.5f : Main.sBias;
+            frostTask = new java.util.concurrent.FutureTask<>(
+                    () -> CoverCompose.frostedFor(srcArt, fw, fh, fb));
+            new Thread(frostTask, "mc-cover-frost").start();
+        }
         Bitmap full;
         try {
             full = composeWallpaper(art, w, h, Main.sBias);
@@ -176,6 +189,17 @@ final class CoverPush {
         }
         Main.measureCover(full);
         if (Main.sCoverMode) Main.recolorClock();
+        if (frostTask != null) {
+            // Up before the JPEG: the view is this process's own, and only reads `full`, which
+            // the encode below only reads too.
+            Bitmap frosted = null;
+            try {
+                frosted = frostTask.get();
+            } catch (Throwable t) {
+                Xp.log(Main.TAG + "frosted video cover failed: " + t);
+            }
+            showVideoCover(ctx, true, full, frosted, artPrint(art));
+        }
         long tc = android.os.SystemClock.uptimeMillis();
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         int q = 95;
@@ -214,20 +238,8 @@ final class CoverPush {
                 + " as " + jpg.length + "B jpeg, draw " + (tc - t0) + "ms encode "
                 + (android.os.SystemClock.uptimeMillis() - tc) + "ms");
 
-        if (Main.sVideoWallpaper) {
-            // The print of the ARTWORK, not of this composed bitmap: the bias moves where the
-            // sharp band sits, so the composed picture differs on every slider tick while the
-            // album has not changed at all - and a fade on each of those would breathe.
-            Bitmap frosted = null;
-            try {
-                frosted = CoverCompose.frosted(full);
-            } catch (Throwable t) {
-                Xp.log(Main.TAG + "frosted video cover failed: " + t);
-            }
-            showVideoCover(ctx, true, full, frosted, artPrint(art));
-        } else {
-            full.recycle();
-        }
+        // On the video path `full` went to the view above, which owns it now.
+        if (!Main.sVideoWallpaper) full.recycle();
     }
 
     /**
@@ -716,6 +728,20 @@ final class CoverPush {
             sCoverFadeGapMs = gap;
         }
         releaseCoverFadeWait("the wallpaper window is reloading");
+    }
+
+    /**
+     * The wallpaper window is about to take a new cover: its player rebuild is some 180ms from a
+     * first frame. A track change's crossfade inside the view starts here rather than on
+     * videoreload. The window swaps in one frame and the cards and notifications blur the
+     * window, so a crossfade begun after the swap left them a whole fade ahead of the background
+     * behind them - reported as the card changing before the cover. Begun now, the window's swap
+     * lands about half way through the view's.
+     */
+    static void noteVideoReloading() {
+        if (sOwedSwap != null && sCoverFadeWaiting) {
+            releaseCoverFadeWait("the wallpaper window is about to reload");
+        }
     }
 
     /** Starts the owed fade, if the cover is on screen for it. See sCoverFadeWaitMs. */

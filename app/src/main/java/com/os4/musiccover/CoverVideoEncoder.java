@@ -102,6 +102,22 @@ public class CoverVideoEncoder {
         return ok;
     }
 
+    /**
+     * Whether destFile already holds the one-frame cover for this key - the same key
+     * encodeToMp4() would compute, without the pictures. 0 is never a hit.
+     */
+    public static synchronized boolean isCached(File destFile, long contentKey, boolean depthTrack) {
+        if (contentKey == 0) return false;
+        if (depthTrack) contentKey = ~contentKey;
+        Long cachedKey = sCachedKeys.get(destFile.getAbsolutePath());
+        if (cachedKey == null || cachedKey != contentKey || !destFile.exists()
+                || destFile.length() == 0) {
+            return false;
+        }
+        sCachedVideoPath = destFile.getAbsolutePath();
+        return true;
+    }
+
     private static boolean encodeOnce(Bitmap from, Bitmap to, File destFile,
                                       long contentKey, long fadeMs, boolean depthTrack) {
         Bitmap bitmap = to;
